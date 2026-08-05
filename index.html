@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PROJECT THERMO — P0 renderer proof</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #050508; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  #tag {
+    position: fixed; left: 10px; bottom: 8px; z-index: 2;
+    font: 10px/1.4 ui-monospace, Menlo, monospace; color: #4a4650;
+    user-select: none; pointer-events: none; letter-spacing: 0.06em;
+  }
+  #err {
+    position: fixed; inset: 12px; z-index: 3; display: none;
+    font: 12px/1.5 ui-monospace, Menlo, monospace; color: #ff9a8a;
+    white-space: pre-wrap; overflow: auto; background: rgba(10,6,6,0.92);
+    padding: 12px; border: 1px solid #5a2020; border-radius: 6px;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="tag">PROJECT THERMO · P0 renderer proof · scripted paths, no sim</div>
+<div id="err"></div>
+<script>
+"use strict";
+
+/* ================= CONFIG =================
+   All constants live here (TDD §10, §13). P0 uses the render/optics subset;
+   sim constants arrive in P1. Values from the §10 starting table where they
+   exist; the rest are P0 render dials, to be moved by calibration (§11).   */
+const CONFIG = {
+  timeScale: 1.0,          // §8 — exposed; override with ?ts=N for quick checks
+
+  // ---- vessel / lamp geometry (lamp height = 1.0) ----
+  glassRadius: 0.24,
+  glassY0: 0.0,
+  glassY1: 1.0,
+  baseTopR: 0.255, baseBotR: 0.34, baseY0: -0.34, baseY1: 0.005,
+  capBotR: 0.255,  capTopR: 0.10,  capY0: 0.995,  capY1: 1.16,
+  bulbPos: [0.0, -0.10, 0.0],
+
+  // ---- optics (§10) ----
+  sigmaRGB: [0.4, 2.8, 3.2],  // absorption, classic red
+  sigmaScale: 14.0,           // maps lamp-unit thickness into sigma exponent
+  kE: 0.6,                    // temperature emissive gain
+  iorBend: 0.80,              // combined air→glass→liquid single-bend ratio (§9.1.3)
+  glassF0: 0.055,
+  bulbColor: [1.0, 0.56, 0.20],
+  bulbGain: 1.35,
+  bulbFalloff: 26.0,
+  liquidTint: [1.0, 0.44, 0.16], // dyed-liquid fog color (scaled by glare)
+  fogDensity: 1.1,
+  underK: 16.0,               // under-light occlusion strength (#17)
+  waxAlbedo: [0.62, 0.05, 0.03],
+  exposure: 1.25,
+
+  // ---- shape / smin ----
+  sminK: 0.055,               // P0: uniform softness (per-blob channel exists)
+
+  // ---- camera ----
+  camPos: [0.0, 0.40, 1.75],
+  camTarget: [0.0, 0.52, 0.0],
+  camFocal: 2.2,
+  swayDeg: 0.5, swayHz: 0.021, // §9.1 idle sway
+
+  // ---- render ----
+  maxSteps: 80, thicknessSteps: 16, underSteps: 8,
+  renderScale: 1.0, maxDPR: 2.0,
+
+  // ---- P0 scripted blob paths (replaced by L1 in P1) ----
+  // movers: [radius, x0, zJitter, periodSec, phase, lateralAmp]
+  movers: [
+    [0.095, -0.060,  0.050, 130, 0.0, 0.030],
+    [0.075,  0.080, -0.060,  95, 2.0, 0.028],
+    [0.060, -0.110, -0.030,  78, 4.1, 0.022],
+    [0.085,  0.030,  0.065, 110, 1.1, 0.030],
+    [0.055,  0.120,  0.020,  70, 5.0, 0.018],
+    [0.070, -0.020, -0.070,  88, 3.2, 0.026],
+  ],
+  // bottom pool dome: two pinned spheres, smin does the rest (stand-in for §6.2)
+  pool: [
+    [0.155, -0.085, -0.075, 0.01],
+    [0.150,  0.085, -0.080, -0.02],
+  ],
+};
+
+const NBLOB = CONFIG.movers.length + CONFIG.pool.length;
+
+const qs = new URLSearchParams(location.search);
+if (qs.has("ts")) CONFIG.timeScale = parseFloat(qs.get("ts")) || 1.0;
+
+/* ================= SHADERS ================= */
+const VERT = `#version 300 es
+void main() {
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const f = (x) => {
+  const s = Number(x).toPrecision(7);
+  return s.includes(".") || s.includes("e") ? s : s + ".0";
+};
+const v3 = (a) => `vec3(${f(a[0])}, ${f(a[1])}, ${f(a[2])})`;
+
+const FRAG = `#version 300 es
+precision highp float;
+
+#define NBLOB ${NBLOB}
+#define MAX_STEPS ${CONFIG.maxSteps}
+#define THICK_STEPS ${CONFIG.thicknessSteps}
+#define UNDER_STEPS ${CONFIG.underSteps}
+
+#define R_GLASS ${f(CONFIG.glassRadius)}
+#define GLASS_Y0 ${f(CONFIG.glassY0)}
+#define GLASS_Y1 ${f(CONFIG.glassY1)}
+#define BULB_POS ${v3(CONFIG.bulbPos)}
+#define SIGMA (${v3(CONFIG.sigmaRGB)} * ${f(CONFIG.sigmaScale)})
+#define K_E ${f(CONFIG.kE)}
+#define IOR_BEND ${f(CONFIG.iorBend)}
+#define GLASS_F0 ${f(CONFIG.glassF0)}
+#define BULB_COLOR ${v3(CONFIG.bulbColor)}
+#define BULB_GAIN ${f(CONFIG.bulbGain)}
+#define BULB_FALLOFF ${f(CONFIG.bulbFalloff)}
+#define LIQUID_TINT ${v3(CONFIG.liquidTint)}
+#define FOG_DENSITY ${f(CONFIG.fogDensity)}
+#define UNDER_K ${f(CONFIG.underK)}
+#define WAX_ALBEDO ${v3(CONFIG.waxAlbedo)}
+#define EXPOSURE ${f(CONFIG.exposure)}
+#define CAM_FOCAL ${f(CONFIG.camFocal)}
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform vec4  uBlobA[NBLOB];  // xyz = pos, w = radius
+uniform vec4  uBlobB[NBLOB];  // x = T, y = sminK, zw reserved (L2 stretch)
+
+out vec4 outColor;
+
+/* ---------- SDF helpers ---------- */
+float smin(float a, float b, float k) {
+  float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+  return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+float sdWax(vec3 p) {
+  float d = 1e5;
+  for (int i = 0; i < NBLOB; i++) {
+    float di = length(p - uBlobA[i].xyz) - uBlobA[i].w;
+    d = smin(d, di, uBlobB[i].y);
+  }
+  // pool floor: clamp wax to sit on vessel bottom
+  d = max(d, GLASS_Y0 - 0.02 - p.y);
+  return d;
+}
+
+// temperature of nearest wax, contribution-weighted (drives emissive, #17)
+float waxT(vec3 p) {
+  float wsum = 1e-5, tsum = 0.0;
+  for (int i = 0; i < NBLOB; i++) {
+    float di = length(p - uBlobA[i].xyz) - uBlobA[i].w;
+    float w = exp(-di * 18.0);
+    wsum += w; tsum += w * uBlobB[i].x;
+  }
+  return tsum / wsum;
+}
+
+vec3 waxNormal(vec3 p) {
+  const vec2 e = vec2(0.0015, -0.0015);
+  return normalize(e.xyy * sdWax(p + e.xyy) + e.yyx * sdWax(p + e.yyx) +
+                   e.yxy * sdWax(p + e.yxy) + e.xxx * sdWax(p + e.xxx));
+}
+
+/* ---------- metal base & cap ---------- */
+float sdCappedCone(vec3 p, vec3 a, vec3 b, float ra, float rb) {
+  float rba = rb - ra;
+  float baba = dot(b - a, b - a);
+  float papa = dot(p - a, p - a);
+  float paba = dot(p - a, b - a) / baba;
+  float x = sqrt(max(papa - paba * paba * baba, 0.0));
+  float cax = max(0.0, x - ((paba < 0.5) ? ra : rb));
+  float cay = abs(paba - 0.5) - 0.5;
+  float k = rba * rba + baba;
+  float fq = clamp((rba * (x - ra) + paba * baba) / k, 0.0, 1.0);
+  float cbx = x - ra - fq * rba;
+  float cby = paba - fq;
+  float s = (cbx < 0.0 && cay < 0.0) ? -1.0 : 1.0;
+  return s * sqrt(min(cax * cax + cay * cay * baba, cbx * cbx + cby * cby * baba));
+}
+
+float sdMetal(vec3 p) {
+  float base = sdCappedCone(p, vec3(0.0, ${f(CONFIG.baseY0)}, 0.0), vec3(0.0, ${f(CONFIG.baseY1)}, 0.0),
+                            ${f(CONFIG.baseBotR)}, ${f(CONFIG.baseTopR)});
+  float cap  = sdCappedCone(p, vec3(0.0, ${f(CONFIG.capY0)}, 0.0), vec3(0.0, ${f(CONFIG.capY1)}, 0.0),
+                            ${f(CONFIG.capBotR)}, ${f(CONFIG.capTopR)});
+  return min(base, cap);
+}
+
+vec3 metalNormal(vec3 p) {
+  const vec2 e = vec2(0.002, -0.002);
+  return normalize(e.xyy * sdMetal(p + e.xyy) + e.yyx * sdMetal(p + e.yyx) +
+                   e.yxy * sdMetal(p + e.yxy) + e.xxx * sdMetal(p + e.xxx));
+}
+
+/* ---------- analytic vessel intersection ---------- */
+// segment of ray inside the glass cylinder band; hit if result.x < result.y
+vec2 vesselSpan(vec3 ro, vec3 rd) {
+  float a = dot(rd.xz, rd.xz);
+  if (a < 1e-7) a = 1e-7;
+  float b = 2.0 * dot(ro.xz, rd.xz);
+  float c = dot(ro.xz, ro.xz) - R_GLASS * R_GLASS;
+  float h = b * b - 4.0 * a * c;
+  if (h < 0.0) return vec2(1.0, -1.0);
+  h = sqrt(h);
+  float t0 = (-b - h) / (2.0 * a);
+  float t1 = (-b + h) / (2.0 * a);
+  float ty0 = (GLASS_Y0 - ro.y) / rd.y;
+  float ty1 = (GLASS_Y1 - ro.y) / rd.y;
+  float tyMin = min(ty0, ty1), tyMax = max(ty0, ty1);
+  return vec2(max(t0, tyMin), min(t1, tyMax));
+}
+
+/* ---------- environment / background ---------- */
+vec3 envColor(vec3 rd) {
+  // fake 2-band room: warm dark below, cool dim above + faint window streak
+  vec3 c = mix(vec3(0.035, 0.016, 0.010), vec3(0.010, 0.013, 0.022),
+               smoothstep(-0.3, 0.7, rd.y));
+  float streak = exp(-rd.x * rd.x * 40.0) * smoothstep(-0.1, 0.8, rd.y);
+  c += vec3(0.05, 0.06, 0.08) * streak;
+  return c;
+}
+
+vec3 background(vec3 rd) {
+  vec3 c = mix(vec3(0.014, 0.011, 0.018), vec3(0.002, 0.002, 0.005),
+               smoothstep(-0.6, 0.9, rd.y));
+  // warm floor spill from the lamp
+  c += vec3(0.030, 0.012, 0.004) * exp(-(rd.y + 0.45) * (rd.y + 0.45) * 22.0);
+  return c;
+}
+
+/* ---------- liquid: fog + bulb glare along a segment (#17, #20) ---------- */
+vec3 liquidRadiance(vec3 p0, vec3 rd, float len) {
+  vec3 q = BULB_POS - p0;
+  float tc = clamp(dot(q, rd), 0.0, len);
+  float dc = length(q - rd * tc);
+  float glare = BULB_GAIN / (1.0 + dc * dc * BULB_FALLOFF);
+  float amt = 1.0 - exp(-len * FOG_DENSITY);
+  return LIQUID_TINT * glare * amt * 0.28;
+}
+
+/* ---------- lights ---------- */
+const vec3 KEY_DIR = normalize(vec3(0.55, 0.9, 0.8));
+const vec3 KEY_COL = vec3(0.20, 0.22, 0.27);
+
+vec3 shadeMetal(vec3 p, vec3 rd) {
+  vec3 n = metalNormal(p);
+  vec3 alb = vec3(0.045, 0.042, 0.048);
+  vec3 col = alb * (0.25 + 0.75 * max(n.y, 0.0)) * vec3(0.12, 0.12, 0.16);
+  // key light
+  float diff = max(dot(n, KEY_DIR), 0.0);
+  vec3 hv = normalize(KEY_DIR - rd);
+  col += KEY_COL * (alb * diff + 0.30 * pow(max(dot(n, hv), 0.0), 40.0));
+  // bulb leak: warm ring where base meets glass, dim wash on cap underside
+  vec3 toBulb = BULB_POS - p;
+  float dB = length(toBulb);
+  float leak = exp(-abs(p.y - ${f(CONFIG.baseY1)}) * 14.0) * (p.y < 0.5 ? 1.0 : 0.0);
+  col += BULB_COLOR * 0.35 * leak / (1.0 + dB * dB * 8.0);
+  float capGlow = (p.y > 0.5) ? exp(-(p.y - ${f(CONFIG.capY0)}) * 9.0) : 0.0;
+  col += vec3(0.35, 0.10, 0.05) * 0.10 * capGlow * max(-n.y, 0.0);
+  return col;
+}
+
+/* ---------- main ---------- */
+void main() {
+  vec2 uv = (2.0 * gl_FragCoord.xy - uRes) / uRes.y;
+
+  // camera with idle sway (§9.1)
+  float sway = ${f(CONFIG.swayDeg * Math.PI / 180)} * sin(uTime * ${f(CONFIG.swayHz * 2 * Math.PI)});
+  float cs = cos(sway), sn = sin(sway);
+  vec3 ro = ${v3(CONFIG.camPos)};
+  ro.xz = mat2(cs, -sn, sn, cs) * ro.xz;
+  vec3 ta = ${v3(CONFIG.camTarget)};
+  vec3 fw = normalize(ta - ro);
+  vec3 rt = normalize(cross(fw, vec3(0.0, 1.0, 0.0)));
+  vec3 up = cross(rt, fw);
+  vec3 rd = normalize(fw * CAM_FOCAL + rt * uv.x + up * uv.y);
+
+  vec3 col;
+
+  // metal base/cap: short march (they are convex and cheap)
+  float tMetal = -1.0;
+  {
+    float t = 0.5;
+    for (int i = 0; i < 48; i++) {
+      vec3 p = ro + rd * t;
+      float d = sdMetal(p);
+      if (d < 0.0015) { tMetal = t; break; }
+      t += d;
+      if (t > 4.0) break;
+    }
+  }
+
+  vec2 span = vesselSpan(ro, rd);
+  bool hitGlass = span.x < span.y && span.y > 0.0 && (tMetal < 0.0 || span.x < tMetal);
+
+  if (hitGlass) {
+    float tG = max(span.x, 0.0);
+    vec3 pG = ro + rd * tG;
+    vec3 nG = normalize(vec3(pG.x, 0.0, pG.z));
+
+    // single combined refraction bend at entry (§9.1.3)
+    vec3 rd2 = refract(rd, nG, IOR_BEND);
+    if (dot(rd2, rd2) < 0.5) rd2 = rd;
+
+    // interior segment for the bent ray
+    vec3 roIn = pG + rd2 * 0.002;
+    vec2 spanIn = vesselSpan(roIn, rd2);
+    float tMax = max(spanIn.y, 0.0);
+
+    // ---- raymarch wax (§9.1.4) ----
+    float t = 0.0;
+    float hit = -1.0;
+    for (int i = 0; i < MAX_STEPS; i++) {
+      vec3 p = roIn + rd2 * t;
+      float d = sdWax(p);
+      if (d < 0.0012 * (1.0 + t)) { hit = t; break; }
+      t += d * 0.9;
+      if (t > tMax) break;
+    }
+
+    if (hit >= 0.0) {
+      vec3 ph = roIn + rd2 * hit;
+      vec3 n = waxNormal(ph);
+      float Th = waxT(ph);
+
+      // a. thickness march to exit (§9.1.5a)
+      float th = 0.004;
+      for (int i = 0; i < THICK_STEPS; i++) {
+        vec3 p = ph + rd2 * th;
+        float s = sdWax(p);
+        if (s > 0.003) break;
+        th += max(-s, 0.012);
+      }
+
+      // b. Beer–Lambert transmittance (#16)
+      vec3 trans = exp(-SIGMA * th);
+
+      // light arriving from behind the wax = liquid glare there
+      vec3 pExit = ph + rd2 * th;
+      float remLen = max(tMax - (hit + th), 0.0);
+      vec3 behind = liquidRadiance(pExit, rd2, remLen) +
+                    BULB_COLOR * BULB_GAIN * 0.16 /
+                    (1.0 + dot(pExit - BULB_POS, pExit - BULB_POS) * BULB_FALLOFF);
+
+      // c. under-light: short march toward bulb (#17)
+      vec3 dirB = normalize(BULB_POS - ph);
+      float occ = 0.0;
+      for (int i = 0; i < UNDER_STEPS; i++) {
+        vec3 p = ph + dirB * (float(i) + 0.5) * 0.035;
+        occ += max(-sdWax(p), 0.0);
+      }
+      float dBulb = length(BULB_POS - ph);
+      float A = exp(-occ * UNDER_K) / (1.0 + dBulb * dBulb * 2.4);
+      float fscat = 0.30 + 0.70 * pow(max(dot(rd2, dirB), 0.0), 2.0);
+      vec3 under = BULB_COLOR * A * (fscat + K_E * Th) * 1.1;
+
+      // translucent rim: light piped through thin silhouette wax
+      vec3 rimGlow = BULB_COLOR * A * pow(1.0 - abs(dot(n, rd2)), 2.5) * (0.5 + 0.8 * Th);
+
+      // body: absorbed fraction re-emits albedo lit from below + faint ambient
+      vec3 body = (1.0 - trans) * WAX_ALBEDO * (under * 2.2 + vec3(0.020, 0.016, 0.022));
+
+      // d. specular, Fresnel-weighted (#19)
+      float fres = pow(1.0 - max(dot(n, -rd2), 0.0), 5.0);
+      vec3 hB = normalize(dirB - rd2);
+      vec3 hK = normalize(KEY_DIR - rd2);
+      vec3 spec = BULB_COLOR * pow(max(dot(n, hB), 0.0), 48.0) * 0.7
+                + KEY_COL * pow(max(dot(n, hK), 0.0), 64.0) * 2.2;
+      spec *= (0.06 + 0.94 * fres);
+
+      // fog between glass and wax surface
+      vec3 nearFog = liquidRadiance(roIn, rd2, hit);
+
+      col = trans * behind * 3.2 + body + under + rimGlow + spec + nearFog;
+    } else {
+      // miss: pure liquid path (#12 motes are P5; #20 tint fog)
+      float len = tMax;
+      col = liquidRadiance(roIn, rd2, len);
+      // bulb glare disc seen through the liquid bottom
+      vec3 q = BULB_POS - roIn;
+      float tc = clamp(dot(q, rd2), 0.0, len);
+      float dc = length(q - rd2 * tc);
+      col += BULB_COLOR * BULB_GAIN * 0.10 / (0.004 + dc * dc * 20.0) * 0.02;
+      // ray leaves the vessel: dim background behind, or metal behind glass
+      vec3 pOut = roIn + rd2 * len;
+      col += 0.85 * background(rd2) * (1.0 - smoothstep(0.0, 0.25, 0.0));
+      if (pOut.y < GLASS_Y0 + 0.02) col += vec3(0.05, 0.02, 0.01);
+    }
+
+    // glass Fresnel: env reflection mix (§9.1.3, #18)
+    float fresG = GLASS_F0 + (1.0 - GLASS_F0) * pow(1.0 - max(dot(-rd, nG), 0.0), 5.0);
+    col = mix(col, envColor(reflect(rd, nG)) * 2.0, clamp(fresG, 0.0, 1.0));
+    // bright rim where view grazes the cylinder
+    float rim = pow(1.0 - max(dot(-rd, nG), 0.0), 12.0);
+    col += vec3(0.5, 0.45, 0.42) * rim * 0.10;
+  } else if (tMetal > 0.0) {
+    col = shadeMetal(ro + rd * tMetal, rd);
+  } else {
+    col = background(rd);
+    // halo around the vessel silhouette (cheap bloom stand-in until P5 #21)
+    vec2 spanH = vesselSpan(ro, rd);
+    float missBy = spanH.x - spanH.y;
+    if (missBy > 0.0) col += vec3(0.10, 0.035, 0.012) * exp(-missBy * 30.0) * 0.5;
+  }
+
+  // tonemap + gamma
+  col *= EXPOSURE;
+  col = clamp((col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14), 0.0, 1.0);
+  col = pow(col, vec3(1.0 / 2.2));
+
+  // vignette
+  float vig = 1.0 - 0.28 * dot(uv * 0.6, uv * 0.6);
+  col *= vig;
+
+  // dither (#22) — interleaved gradient noise (blue-noise texture in P5 if banding shows)
+  float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  col += (ign - 0.5) * (2.0 / 255.0);
+
+  outColor = vec4(col, 1.0);
+}`;
+
+/* ================= HOST ================= */
+const canvas = document.getElementById("c");
+const errBox = document.getElementById("err");
+const gl = canvas.getContext("webgl2", { antialias: false, alpha: false });
+
+function fail(msg) {
+  errBox.style.display = "block";
+  errBox.textContent = msg;
+  throw new Error(msg);
+}
+if (!gl) fail("WebGL2 not available on this device/browser.");
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    fail("Shader compile error:\n" + gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+  fail("Program link error:\n" + gl.getProgramInfoLog(prog));
+}
+gl.useProgram(prog);
+
+const uRes = gl.getUniformLocation(prog, "uRes");
+const uTime = gl.getUniformLocation(prog, "uTime");
+const uBlobA = gl.getUniformLocation(prog, "uBlobA");
+const uBlobB = gl.getUniformLocation(prog, "uBlobB");
+
+const blobA = new Float32Array(NBLOB * 4);
+const blobB = new Float32Array(NBLOB * 4);
+
+/* P0 scripted paths (§12 P0): sine verticals at real-lamp transit periods,
+   light lateral sway, fixed z-jitter. Replaced wholesale by L1 in P1. */
+function updateBlobs(t) {
+  const R = CONFIG.glassRadius;
+  let i = 0;
+  for (const [r, x0, z, period, phase, lat] of CONFIG.movers) {
+    const w = (2 * Math.PI) / period;
+    const y = 0.5 + 0.42 * Math.sin(w * t + phase);
+    let x = x0 + lat * Math.sin(w * 2.7 * t + phase * 1.7);
+    const maxX = R - r - 0.015;
+    x = Math.max(-maxX, Math.min(maxX, x));
+    const T = Math.max(0.05, Math.min(1.0, 1.15 - 1.3 * y)); // hot low, cold high
+    blobA.set([x, y, z, r], i * 4);
+    blobB.set([T, CONFIG.sminK, 0, 0], i * 4);
+    i++;
+  }
+  for (const [r, x, z, yOff] of CONFIG.pool) {
+    // pool breathes almost imperceptibly (#23 preview)
+    const y = -0.075 + yOff + 0.006 * Math.sin(t * 0.35 + x * 20);
+    blobA.set([x, y, z, r], i * 4);
+    blobB.set([0.92, CONFIG.sminK * 1.4, 0, 0], i * 4);
+    i++;
+  }
+}
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, CONFIG.maxDPR) * CONFIG.renderScale;
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+    gl.viewport(0, 0, w, h);
+  }
+}
+window.addEventListener("resize", resize);
+
+const t0 = performance.now();
+function frame() {
+  resize();
+  const t = ((performance.now() - t0) / 1000) * CONFIG.timeScale;
+  updateBlobs(t);
+  gl.uniform2f(uRes, canvas.width, canvas.height);
+  gl.uniform1f(uTime, t);
+  gl.uniform4fv(uBlobA, blobA);
+  gl.uniform4fv(uBlobB, blobB);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  requestAnimationFrame(frame); // rAF self-throttles when tab is hidden (§8)
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
