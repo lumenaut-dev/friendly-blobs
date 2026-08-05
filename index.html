@@ -22,7 +22,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="tag">PROJECT THERMO · P0 renderer proof · scripted paths, no sim</div>
+<div id="tag">PROJECT THERMO · P1 thermal circulation · L1 sim live</div>
 <div id="err"></div>
 <script>
 "use strict";
@@ -31,6 +31,7 @@
    All constants live here (TDD §10, §13). P0 uses the render/optics subset;
    sim constants arrive in P1. Values from the §10 starting table where they
    exist; the rest are P0 render dials, to be moved by calibration (§11).   */
+/*CONFIG-BEGIN*/
 const CONFIG = {
   timeScale: 1.0,          // §8 — exposed; override with ?ts=N for quick checks
 
@@ -70,22 +71,43 @@ const CONFIG = {
   maxSteps: 80, thicknessSteps: 16, underSteps: 8,
   renderScale: 1.0, maxDPR: 2.0,
 
-  // ---- P0 scripted blob paths (replaced by L1 in P1) ----
-  // movers: [radius, x0, zJitter, periodSec, phase, lateralAmp]
-  movers: [
-    [0.095, -0.060,  0.050, 170, 0.0, 0.030],
-    [0.075,  0.080, -0.060, 125, 2.0, 0.028],
-    [0.060, -0.110, -0.030, 105, 4.1, 0.022],
-    [0.085,  0.030,  0.065, 145, 1.1, 0.030],
-    [0.055,  0.120,  0.020,  92, 5.0, 0.018],
-    [0.070, -0.020, -0.070, 115, 3.2, 0.026],
-  ],
-  dwellPow: 0.62,          // <1 → long hover at turnarounds, quicker mid-column (#1 fake)
-  // trailing-neck tails (#8 P0 fake): each mover drags sources that lag its
-  // own path — neck length scales with speed automatically, taper via radii
-  tailLagFrac: 0.030,      // lag = period * frac (seconds)
-  tailLagMul: [1.0, 1.9],
-  tailRadii:  [0.60, 0.36],
+  // ---- L1 thermal blob sim (§5) — P1: free blobs, teleport-recycle in pool ----
+  sim: {
+    dt: 1 / 60,            // fixed sim step, wall-clock decoupled (§8)
+    nFree: 9,
+    gSim: 22,              // global speed master (§5.3); calibrated via harness
+    rhoLiq: 1.0, rhoWax0: 1.035, beta: 0.07,  // density crossover at T ≈ 0.483
+    cV: 2.0, cH: 3.2,      // anisotropic drag (vertical/horizontal)
+    rRef: 0.045,           // reference radius for 1/r thermal scaling
+    TMelt: 0.28, meltWidth: 0.08,
+    // cooling zones k_zone(y) + ambient profile T_amb(y) (§5.2 step 1)
+    // T_amb must sit well below the ρ crossover (0.483) or blobs equilibrate
+    // into neutral-buoyancy limbo mid-column instead of committing to a fall
+    // cooling must dominate everywhere the bulb doesn't directly reach, or a
+    // thermal equilibrium at T≈crossover forms mid-column and blobs limbo there
+    kZoneMid: 0.0145, kZoneTop: 0.10,
+    zoneMidLo: 0.06, zoneMidHi: 0.18, zoneTopLo: 0.70, zoneTopHi: 0.86,
+    TambBottom: 0.65, TambMid: 0.28, TambTop: 0.05,
+    // bulb heat is cut off above the pool-stick zone (coil heats wax by
+    // contact, §3.4). Invariant: everywhere aloft the net thermal drive is
+    // negative — any altitude where heating balances cooling near T≈crossover
+    // becomes a capture equilibrium that permanently traps blobs
+    kBulb: 0.12, bulbSigma: 0.13, bulbCutLo: 0.03, bulbCutHi: 0.10,
+    // detachment size distribution (row #2: size diversity → phase diversity)
+    radiusMean: 0.062, radiusSpread: 0.35, rMin: 0.042, rMax: 0.095,
+    spawnTMin: 0.24, spawnTMax: 0.36,  // spawn cool → heats in pool → lifts off
+    // pool sticking (row #5 P1-lite): wax clings to the pool until hot enough,
+    // so blobs detach hot and rise decisively instead of crawling off lukewarm
+    poolStickY: 0.05, detachTBase: 0.84, detachTSpread: 0.10,
+    recycleY: 0.03, recycleT: 0.45,    // cold blob sinking into pool is absorbed
+    floorY: 0.012, wallMargin: 0.012,
+    seedJitter: 0.10,      // ±10% per-blob param noise (row #2)
+  },
+  // L2-lite: trailing necks from position history + velocity stretch (#8).
+  // Tails follow the blob's real past positions, so neck length tracks sim
+  // speed; in P2+ real merge/detach events replace the looping-tail fake.
+  tailLagS: [2.3, 4.4],
+  tailRadii: [0.60, 0.36],
   stretchMax: 0.45,        // velocity elongation cap (#8)
   stretchVref: 0.016,
   // bottom pool dome: two pinned spheres, smin does the rest (stand-in for §6.2)
@@ -103,8 +125,9 @@ const CONFIG = {
   topPoolY: 1.025,
   ceilY: 0.985,            // liquid ceiling clamp — flattens the reservoir top
 };
+/*CONFIG-END*/
 
-const NBLOB = CONFIG.movers.length * (1 + CONFIG.tailRadii.length) +
+const NBLOB = CONFIG.sim.nFree * (1 + CONFIG.tailRadii.length) +
               CONFIG.pool.length + CONFIG.topPool.length;
 
 const qs = new URLSearchParams(location.search);
@@ -496,55 +519,154 @@ const uBlobB = gl.getUniformLocation(prog, "uBlobB");
 const blobA = new Float32Array(NBLOB * 4);
 const blobB = new Float32Array(NBLOB * 4);
 
-/* P0 scripted paths (§12 P0): dwell-shaped sine verticals running pool to
-   pool, lagging tail sources for trailing necks, velocity stretch.
-   Replaced wholesale by L1 in P1. */
+/*SIM-BEGIN*/
+/* L1 — thermal blob simulation (§5). P1 scope: free blobs only; a blob that
+   sinks cold into the bottom pool teleport-recycles as a fresh spawn hidden
+   inside the pool mass. No merging, no volume ledger (P2), no real pools (P3). */
 
-// dwell-shaped oscillation: |sin|^p with p<1 lingers at extremes (turnaround
-// hover, #1) and moves quickest mid-column
-function moverPos(m, t) {
-  const [r, x0, z, period, phase, lat] = m;
-  const w = (2 * Math.PI) / period;
-  const s = Math.sin(w * t + phase);
-  const y = 0.5 + 0.5 * Math.sign(s) * Math.pow(Math.abs(s), CONFIG.dwellPow);
-  let x = x0 + lat * Math.sin(w * 2.7 * t + phase * 1.7);
-  const maxX = CONFIG.glassRadius - r - 0.015;
-  x = Math.max(-maxX, Math.min(maxX, x));
-  return [x, y, z];
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const sstep = (a, b, x) => {
+  const u = clamp((x - a) / (b - a), 0, 1);
+  return u * u * (3 - 2 * u);
+};
+
+// ambient liquid temperature falls with height (§3.3)
+function TambAt(y, S) {
+  if (y < 0.3) return S.TambBottom + (S.TambMid - S.TambBottom) * (y / 0.3);
+  return S.TambMid + (S.TambTop - S.TambMid) * clamp((y - 0.3) / 0.7, 0, 1);
+}
+// cooling-rate zones: none at the bulb, mild mid-column, strong at top
+function kZoneAt(y, S) {
+  return S.kZoneMid * sstep(S.zoneMidLo, S.zoneMidHi, y) +
+         (S.kZoneTop - S.kZoneMid) * sstep(S.zoneTopLo, S.zoneTopHi, y);
 }
 
-function updateBlobs(t) {
+function spawnInto(b, C, rng, y0) {
+  const S = C.sim;
+  b.r = clamp(S.radiusMean * Math.exp((rng() * 2 - 1) * S.radiusSpread), S.rMin, S.rMax);
+  b.z = (rng() * 2 - 1) * 0.28 * C.glassRadius;
+  const lim = C.glassRadius - b.r - S.wallMargin;
+  b.xMax = Math.sqrt(Math.max(lim * lim - b.z * b.z, 1e-4));
+  b.x = (rng() * 2 - 1) * b.xMax * 0.8;
+  b.y = y0;
+  b.vx = 0; b.vy = 0;
+  b.aloft = false;  // set once the blob has genuinely flown; gates recycle
+  b.T = S.spawnTMin + rng() * (S.spawnTMax - S.spawnTMin);
+  b.detachT = S.detachTBase + rng() * S.detachTSpread;
+  b.seed = 1 + (rng() * 2 - 1) * S.seedJitter;
+  b.hist = [];            // position history for L2 tails — reset on recycle
+  return b;
+}
+
+function createSim(C, seed) {
+  const rng = mulberry32(seed);
+  const blobs = [];
+  for (let i = 0; i < C.sim.nFree; i++) {
+    const b = spawnInto({}, C, rng, C.sim.floorY + 0.005);
+    // prime mixed traffic: scatter initial heights/temps/velocities (§5.5
+    // traffic guarantee arrives with real pools in P3; this is the P1 stand-in)
+    if (i % 3 === 1) { b.y = 0.2 + rng() * 0.55; b.T = 0.55 + rng() * 0.25; }
+    if (i % 3 === 2) { b.y = 0.6 + rng() * 0.3;  b.T = 0.25 + rng() * 0.2; }
+    blobs.push(b);
+  }
+  return { blobs, rng, t: 0 };
+}
+
+function simStep(sim, C) {
+  const S = C.sim, dt = S.dt;
+  for (const b of sim.blobs) {
+    // 1. thermal: dT/dt = (k_zone·(T_amb − T) + k_bulb·bulbGain) · (r_ref/r)
+    const dx = b.x - C.bulbPos[0], dy = b.y - C.bulbPos[1];
+    const gB = Math.exp(-(dx * dx + dy * dy) / (2 * S.bulbSigma * S.bulbSigma)) *
+               (1 - sstep(S.bulbCutLo, S.bulbCutHi, b.y));
+    const dT = (kZoneAt(b.y, S) * (TambAt(b.y, S) - b.T) + S.kBulb * gB) *
+               (S.rRef / b.r) * b.seed;
+    b.T = clamp(b.T + dT * dt, 0, 1);
+    b.melt = sstep(S.TMelt - S.meltWidth, S.TMelt + S.meltWidth, b.T);
+
+    // 2. forces: buoyancy from ρ(T) crossover (§5.3), anisotropic drag
+    const rhoWax = S.rhoWax0 * (1 - S.beta * b.T);
+    let ab = S.gSim * b.seed * (S.rhoLiq - rhoWax) / rhoWax;
+    if (ab > 0) ab *= Math.sqrt(b.melt);  // melt gates rising, not sinking
+    // pool sticking: cling to the pool until hot enough to detach (#5 lite)
+    if (b.y < S.poolStickY && b.T < b.detachT) ab = Math.min(ab, 0);
+    const ay = ab - (S.cV * b.vy) / b.r;
+    const ax = -(S.cH * b.vx) / b.r;
+
+    // 3. semi-implicit Euler (§5.2 step 3); px/py kept for render interpolation
+    b.px = b.x; b.py = b.y;
+    b.vy += ay * dt; b.vx += ax * dt;
+    b.y += b.vy * dt; b.x += b.vx * dt;
+
+    // 4. walls: kill normal velocity, damp tangential (§5.2)
+    if (b.x > b.xMax) { b.x = b.xMax; b.vx = 0; b.vy *= 0.98; }
+    if (b.x < -b.xMax) { b.x = -b.xMax; b.vx = 0; b.vy *= 0.98; }
+    const yTop = C.ceilY - 0.03 - b.r * 0.55;  // presses into the top reservoir
+    if (b.y > yTop) { b.y = yTop; if (b.vy > 0) b.vy = 0; b.vx *= 0.98; }
+    if (b.y < S.floorY) { b.y = S.floorY; if (b.vy < 0) b.vy = 0; b.vx *= 0.98; }
+
+    // 5. teleport-recycle (P1 stand-in for pool absorption/detachment):
+    // a blob that flew and sank back cold into the pool respawns hidden
+    // inside it — aloft gate keeps fresh spawns from recycling instantly
+    if (b.y > 0.35) b.aloft = true;
+    if (b.aloft && b.y < S.recycleY && b.T < S.recycleT && b.vy <= 0) {
+      spawnInto(b, C, sim.rng, S.floorY + 0.005);
+    }
+
+    b.hist.push(b.x, b.y);
+    const maxHist = Math.ceil(4.5 / dt) * 2;
+    if (b.hist.length > maxHist) b.hist.splice(0, b.hist.length - maxHist);
+  }
+  sim.t += dt;
+}
+/*SIM-END*/
+
+/* L2-lite + uniform upload: velocity stretch, history tails, scenery pools */
+function histAt(b, lagS, dt) {
+  const n = b.hist.length / 2;
+  const back = Math.min(Math.round(lagS / dt), n - 1);
+  if (back < 0) return [b.x, b.y];
+  const i = (n - 1 - back) * 2;
+  return [b.hist[i], b.hist[i + 1]];
+}
+
+function updateBlobs(sim, t) {
   let i = 0;
-  const put = (pos, r, T, k, stretch) => {
-    blobA.set([pos[0], pos[1], pos[2], r], i * 4);
+  const put = (x, y, z, r, T, k, stretch) => {
+    blobA.set([x, y, z, r], i * 4);
     blobB.set([T, k, stretch, 0], i * 4);
     i++;
   };
-  for (const m of CONFIG.movers) {
-    const r = m[0], period = m[3];
-    const p0 = moverPos(m, t);
-    const T = Math.max(0.05, Math.min(1.0, 1.15 - 1.3 * p0[1])); // hot low, cold high
-    // velocity → elongation (#8)
-    const vy = (p0[1] - moverPos(m, t - 0.5)[1]) / 0.5;
-    const stretch = 1 + CONFIG.stretchMax * Math.min(Math.abs(vy) / CONFIG.stretchVref, 1);
-    put(p0, r, T, CONFIG.sminK, stretch);
-    // trailing tails: lag the same path — the neck stretches with speed and
-    // gets reabsorbed while hovering, all through smin
-    const lag = period * CONFIG.tailLagFrac;
+  const dt = CONFIG.sim.dt;
+  const alpha = sim.alpha ?? 1;  // render interpolation between sim ticks (§8)
+  for (const b of sim.blobs) {
+    const stretch = 1 + CONFIG.stretchMax *
+      Math.min(Math.abs(b.vy) / CONFIG.stretchVref, 1);
+    const rx = (b.px ?? b.x) + (b.x - (b.px ?? b.x)) * alpha;
+    const ry = (b.py ?? b.y) + (b.y - (b.py ?? b.y)) * alpha;
+    put(rx, ry, b.z, b.r, b.T, CONFIG.sminK, stretch);
     for (let k = 0; k < CONFIG.tailRadii.length; k++) {
-      const pt = moverPos(m, t - lag * CONFIG.tailLagMul[k]);
-      put(pt, r * CONFIG.tailRadii[k], T, CONFIG.sminK * 1.6, 1);
+      const p = histAt(b, CONFIG.tailLagS[k], dt);
+      put(p[0], p[1], b.z, b.r * CONFIG.tailRadii[k], b.T, CONFIG.sminK * 1.6, 1);
     }
   }
   for (const [r, x, z, yOff] of CONFIG.pool) {
     // pool breathes almost imperceptibly (#23 preview)
     const y = -0.075 + yOff + 0.006 * Math.sin(t * 0.35 + x * 20);
-    put([x, y, z], r, 0.92, CONFIG.sminK * 1.4, 1);
+    put(x, y, z, r, 0.92, CONFIG.sminK * 1.4, 1);
   }
   for (const [r, x, z] of CONFIG.topPool) {
     // cold reservoir hanging under the dome (#6): dim, deep red, near-static
     const y = CONFIG.topPoolY + 0.005 * Math.sin(t * 0.27 + x * 17);
-    put([x, y, z], r, 0.22, CONFIG.sminK * 1.5, 1);
+    put(x, y, z, r, 0.22, CONFIG.sminK * 1.5, 1);
   }
 }
 
@@ -560,13 +682,24 @@ function resize() {
 }
 window.addEventListener("resize", resize);
 
-const t0 = performance.now();
-function frame() {
+const sim = createSim(CONFIG, 0xC0FFEE);
+let acc = 0;
+let last = performance.now();
+function frame(now) {
   resize();
-  const t = ((performance.now() - t0) / 1000) * CONFIG.timeScale;
-  updateBlobs(t);
+  // fixed-step sim, wall-clock decoupled by timeScale (§8); clamp the
+  // accumulator so a background tab doesn't spiral catching up
+  acc += Math.min((now - last) / 1000, 0.25) * CONFIG.timeScale;
+  last = now;
+  const maxSteps = 600;
+  let steps = Math.min(Math.floor(acc / CONFIG.sim.dt), maxSteps);
+  acc = Math.min(acc - steps * CONFIG.sim.dt, CONFIG.sim.dt);
+  while (steps-- > 0) simStep(sim, CONFIG);
+  sim.alpha = acc / CONFIG.sim.dt;
+
+  updateBlobs(sim, sim.t);
   gl.uniform2f(uRes, canvas.width, canvas.height);
-  gl.uniform1f(uTime, t);
+  gl.uniform1f(uTime, sim.t);
   gl.uniform4fv(uBlobA, blobA);
   gl.uniform4fv(uBlobB, blobB);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
