@@ -13,8 +13,8 @@ let a raymarched SDF renderer manufacture the *appearance* of fluidity.
 
 | Phase | Gate | Status |
 |---|---|---|
-| **P0 — Renderer proof** | screenshot makes you say "oh" | **in progress** — first pass shipped |
-| P1 — Thermal circulation | 15 min unattended mixed traffic | not started |
+| **P0 — Renderer proof** | screenshot makes you say "oh" | **passed** (session 2/7) — reads as wax, not metaballs |
+| **P1 — Thermal circulation** | 15 min unattended mixed traffic | **next up** |
 | P2 — Merge/drainage + volume ledger | kiss-hesitate-fuse; no volume drift | not started |
 | P3 — Pools + detachment + pendant | full self-priming cycle | not started |
 | P4 — Interaction | heat-cursor feels caused, not commanded | not started |

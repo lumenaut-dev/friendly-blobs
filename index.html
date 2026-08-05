@@ -157,6 +157,11 @@ uniform vec4  uBlobB[NBLOB];  // x = T, y = sminK, zw reserved (L2 stretch)
 out vec4 outColor;
 
 /* ---------- SDF helpers ---------- */
+// interleaved gradient noise: decorrelates march quantization and output dither
+float ign(vec2 fc) {
+  return fract(52.9829189 * fract(dot(fc, vec2(0.06711056, 0.00583715))));
+}
+
 float smin(float a, float b, float k) {
   float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
   return mix(b, a, h) - k * h * (1.0 - h);
@@ -341,12 +346,13 @@ void main() {
     float tMax = max(spanIn.y, 0.0);
 
     // ---- raymarch wax (§9.1.4) ----
+    float jit = ign(gl_FragCoord.xy);
     float t = 0.0;
     float hit = -1.0;
     for (int i = 0; i < MAX_STEPS; i++) {
       vec3 p = roIn + rd2 * t;
       float d = sdWax(p);
-      if (d < 0.0012 * (1.0 + t)) { hit = t; break; }
+      if (d < 7e-4 * (1.0 + 0.6 * t)) { hit = t; break; }
       t += d * 0.9;
       if (t > tMax) break;
     }
@@ -356,13 +362,14 @@ void main() {
       vec3 n = waxNormal(ph);
       float Th = waxT(ph);
 
-      // a. thickness march to exit (§9.1.5a)
-      float th = 0.004;
+      // a. thickness march to exit (§9.1.5a) — jittered start + finer floor
+      // so Beer-Lambert doesn't terrace into contour bands in blend regions
+      float th = 0.003 + jit * 0.008;
       for (int i = 0; i < THICK_STEPS; i++) {
         vec3 p = ph + rd2 * th;
         float s = sdWax(p);
         if (s > 0.003) break;
-        th += max(-s, 0.012);
+        th += max(-s, 0.008);
       }
 
       // b. Beer–Lambert transmittance (#16)
@@ -379,7 +386,7 @@ void main() {
       vec3 dirB = normalize(BULB_POS - ph);
       float occ = 0.0;
       for (int i = 0; i < UNDER_STEPS; i++) {
-        vec3 p = ph + dirB * (float(i) + 0.5) * 0.035;
+        vec3 p = ph + dirB * (float(i) + jit) * 0.035;
         occ += max(-sdWax(p), 0.0);
       }
       float dBulb = length(BULB_POS - ph);
@@ -445,9 +452,8 @@ void main() {
   float vig = 1.0 - 0.28 * dot(uv * 0.6, uv * 0.6);
   col *= vig;
 
-  // dither (#22) — interleaved gradient noise (blue-noise texture in P5 if banding shows)
-  float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
-  col += (ign - 0.5) * (2.0 / 255.0);
+  // dither (#22) — IGN (blue-noise texture in P5 if banding still shows)
+  col += (ign(gl_FragCoord.xy) - 0.5) * (2.0 / 255.0);
 
   outColor = vec4(col, 1.0);
 }`;
