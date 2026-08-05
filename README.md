@@ -15,8 +15,8 @@ let a raymarched SDF renderer manufacture the *appearance* of fluidity.
 |---|---|---|
 | **P0 — Renderer proof** | screenshot makes you say "oh" | **passed** (session 2/7) — reads as wax, not metaballs |
 | **P1 — Thermal circulation** | 15 min unattended mixed traffic | **passed** (session 3) — harness-verified, see `tools/calibrate.js` |
-| **P2 — Merge/drainage + volume ledger** | kiss-hesitate-fuse; no volume drift | **next up** |
-| P3 — Pools + detachment + pendant | full self-priming cycle | not started |
+| **P2 — Merge/drainage + volume ledger** | kiss-hesitate-fuse; no volume drift | **passed** (session 4) — drift ~3e-16 over 31 min; fuse delays 2.6–4.7 s |
+| **P3 — Pools + detachment + pendant** | full self-priming cycle | **next up** |
 | P4 — Interaction | heat-cursor feels caused, not commanded | not started |
 | P5 — Polish & calibration | blind test ≤ 75% | not started |
 | P6 — Godot port | budget table §8 on UHD 770 | not started |
@@ -33,6 +33,14 @@ detachment threshold (#5 lite), teleport-recycle hidden inside the pool,
 fixed 1/60 sim step with render interpolation (§8). Necks/stretch come from
 position history (#8 lite). Verified: mid-size transits ~35–40 s, hovers at
 turnarounds, mixed traffic over 15 min unattended (`node tools/calibrate.js`).
+
+P2 scope shipped: §5.4 contact state machine (FREE → CONTACT with film
+pressure + drainage timer gated by |ΔT| and v_rel → MERGING slurp over
+0.8 s), per-blob smin softness driven by merge readiness (dimple → slurp in
+the renderer), coil-zone instant re-merge (#25), and the bottom-pool volume
+ledger (#7): absorption deposits r³, spawns withdraw it, merges are
+volume-exact — total wax is conserved to float epsilon. Depth layers don't
+merge (#26). Pool visual scales with the ledger. Wobble is a stub (#9, P4).
 
 Hard-won tuning invariant (P1): everywhere above the pool-stick zone the net
 thermal drive must be negative (cooling wins). Any altitude where bulb heating

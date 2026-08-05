@@ -22,7 +22,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="tag">PROJECT THERMO · P1 thermal circulation · L1 sim live</div>
+<div id="tag">PROJECT THERMO · P2 merge/drainage · volume ledger live</div>
 <div id="err"></div>
 <script>
 "use strict";
@@ -106,7 +106,21 @@ const CONFIG = {
     recycleY: 0.03, recycleT: 0.45,    // cold blob sinking into pool is absorbed
     floorY: 0.012, wallMargin: 0.012,
     seedJitter: 0.10,      // ±10% per-blob param noise (row #2)
+    // ---- P2: merge/drainage state machine (§5.4) + volume ledger (#7) ----
+    contactEps: 0.01,
+    kFilm: 4.0,            // film pressure — soft repulsion while draining
+    tauDrain0: 2.5,        // base film-drainage time (s)
+    kDeltaT: 6.0,          // drainage penalty per unit |ΔT|
+    dTMax: 0.15, vRelMax: 0.03,   // drainage-progress gates
+    coilY: 0.12, coilTau: 0.05,   // #25: coil zone → near-instant merge
+    tMerge: 0.8,           // slurp duration
+    kHard: 0.018, kSoft: 0.085,   // per-blob smin driven by merge readiness
+    kLerpRate: 6.0,
+    rMaxMerge: 0.105,      // film persists if fusion would exceed this radius
+    poolV0: 5e-4,          // bottom-pool volume ledger seed (lamp units³)
+    spawnCooldown: 4.0,    // min seconds between ledger spawns
   },
+  tailK: 0.07,             // tail smin softness (necks stay soft vs hard blobs)
   // L2-lite: trailing necks from position history + velocity stretch (#8).
   // Tails follow the blob's real past positions, so neck length tracks sim
   // speed; in P2+ real merge/detach events replace the looping-tail fake.
@@ -573,12 +587,27 @@ function spawnInto(b, C, rng, y0) {
   b.x = (rng() * 2 - 1) * b.xMax * 0.8;
   b.y = y0;
   b.vx = 0; b.vy = 0;
-  b.aloft = false;  // set once the blob has genuinely flown; gates recycle
+  b.aloft = false;  // set once the blob has genuinely flown; gates absorption
   b.T = S.spawnTMin + rng() * (S.spawnTMax - S.spawnTMin);
   b.detachT = S.detachTBase + rng() * S.detachTSpread;
   b.seed = 1 + (rng() * 2 - 1) * S.seedJitter;
-  b.hist = [];            // position history for L2 tails — reset on recycle
+  b.hist = [];            // position history for L2 tails — reset on spawn
+  // §5.4 state machine fields
+  b.active = true;
+  b.state = 0;            // 0 FREE | 1 CONTACT | 2 MERGING
+  b.partner = -1;
+  b.drainTimer = 0; b.mReady = 0; b.mergeT = 0;
+  b.kNow = S.kHard;
+  b.wobble = 0; b.wobbleAge = 0;   // #9 preview; real oscillators in P4
   return b;
+}
+
+function setRadius(b, r, C) {
+  const S = C.sim;
+  b.r = r;
+  const lim = C.glassRadius - r - S.wallMargin;
+  b.xMax = Math.sqrt(Math.max(lim * lim - b.z * b.z, 4e-4));
+  b.x = clamp(b.x, -b.xMax, b.xMax);
 }
 
 function createSim(C, seed) {
@@ -592,12 +621,18 @@ function createSim(C, seed) {
     if (i % 3 === 2) { b.y = 0.6 + rng() * 0.3;  b.T = 0.25 + rng() * 0.2; }
     blobs.push(b);
   }
-  return { blobs, rng, t: 0 };
+  return {
+    blobs, rng, t: 0,
+    poolV: C.sim.poolV0,   // #7 ledger: total wax Σr³ + poolV is invariant
+    spawnCd: 0,
+    ev: { merges: [], absorbs: 0, spawns: 0 },  // event log (harness + debug)
+  };
 }
 
 function simStep(sim, C) {
   const S = C.sim, dt = S.dt;
   for (const b of sim.blobs) {
+    if (!b.active) continue;
     // 1. thermal: dT/dt = (k_zone·(T_amb − T) + k_bulb·bulbGain) · (r_ref/r)
     const dx = b.x - C.bulbPos[0], dy = b.y - C.bulbPos[1];
     const gB = Math.exp(-(dx * dx + dy * dy) / (2 * S.bulbSigma * S.bulbSigma)) *
@@ -628,19 +663,147 @@ function simStep(sim, C) {
     if (b.y > yTop) { b.y = yTop; if (b.vy > 0) b.vy = 0; b.vx *= 0.98; }
     if (b.y < S.floorY) { b.y = S.floorY; if (b.vy < 0) b.vy = 0; b.vx *= 0.98; }
 
-    // 5. teleport-recycle (P1 stand-in for pool absorption/detachment):
-    // a blob that flew and sank back cold into the pool respawns hidden
-    // inside it — aloft gate keeps fresh spawns from recycling instantly
     if (b.y > 0.35) b.aloft = true;
-    if (b.aloft && b.y < S.recycleY && b.T < S.recycleT && b.vy <= 0) {
-      spawnInto(b, C, sim.rng, S.floorY + 0.005);
-    }
 
+    // smin softness chases merge readiness (§5.4: dimple → slurp)
+    const kTarget = S.kHard + (S.kSoft - S.kHard) * b.mReady;
+    b.kNow += (kTarget - b.kNow) * Math.min(1, dt * S.kLerpRate);
+    b.wobble *= Math.exp(-dt / 0.9);
+    b.wobbleAge += dt;
+  }
+
+  contactPass(sim, C);
+  mergePass(sim, C);
+  absorbAndSpawn(sim, C);
+
+  for (const b of sim.blobs) {
+    if (!b.active) continue;
     b.hist.push(b.x, b.y);
     const maxHist = Math.ceil(4.5 / dt) * 2;
     if (b.hist.length > maxHist) b.hist.splice(0, b.hist.length - maxHist);
   }
   sim.t += dt;
+}
+
+/* §5.4 contact state machine: FREE → CONTACT (film pressure + drainage
+   timer) → MERGING. Same-layer only — cross-layer passes ride (#26). */
+function contactPass(sim, C) {
+  const S = C.sim, dt = S.dt, bl = sim.blobs;
+  for (const b of bl) if (b.active && b.state === 1) b.state = 0; // re-derive
+  for (let i = 0; i < bl.length; i++) {
+    const a = bl[i];
+    if (!a.active || a.state !== 0) continue;
+    for (let j = i + 1; j < bl.length; j++) {
+      const c = bl[j];
+      if (!c.active || c.state !== 0 || a.layer !== c.layer) continue;
+      const dx = c.x - a.x, dy = c.y - a.y, dz = c.z - a.z;
+      const dist = Math.hypot(dx, dy, dz);
+      if (dist >= a.r + c.r + S.contactEps) continue;
+
+      a.state = c.state = 1;
+      a.partner = j; c.partner = i;
+
+      // film pressure: soft repulsion while the film drains
+      const overlap = a.r + c.r - dist;
+      if (overlap > 0 && dist > 1e-6) {
+        const nx = dx / dist, ny = dy / dist;
+        a.vx -= (nx * S.kFilm * overlap / a.r) * dt;
+        a.vy -= (ny * S.kFilm * overlap / a.r) * dt;
+        c.vx += (nx * S.kFilm * overlap / c.r) * dt;
+        c.vy += (ny * S.kFilm * overlap / c.r) * dt;
+      }
+
+      // drainage timer, gated by |ΔT| and relative velocity
+      const dT = Math.abs(a.T - c.T);
+      const vRel = Math.hypot(a.vx - c.vx, a.vy - c.vy);
+      const inCoil = Math.min(a.y, c.y) < S.coilY;   // #25
+      const tau = inCoil ? S.coilTau : S.tauDrain0 * (1 + S.kDeltaT * dT);
+      let timer = Math.max(a.drainTimer, c.drainTimer);
+      if (dT < S.dTMax && vRel < S.vRelMax) timer += dt;
+      else timer *= Math.pow(0.95, dt * 60);
+      a.drainTimer = c.drainTimer = timer;
+      const m = Math.min(timer / tau, 1);
+      a.mReady = c.mReady = m;
+
+      const rNew = Math.cbrt(a.r ** 3 + c.r ** 3);
+      if (m >= 1 && rNew <= S.rMaxMerge) {
+        a.state = c.state = 2;
+        a.mergeT = c.mergeT = S.tMerge;
+        sim.ev.merges.push({ t: sim.t, delay: timer, coil: inCoil, r: rNew });
+      }
+      break; // one partner max (§5.1 contactPartner)
+    }
+  }
+  for (const b of bl) {
+    if (b.active && b.state === 0) {
+      b.partner = -1;
+      b.drainTimer *= Math.pow(0.95, dt * 60);
+      b.mReady = Math.max(0, b.mReady - dt * 1.5);
+    }
+  }
+}
+
+function mergePass(sim, C) {
+  const S = C.sim, dt = S.dt, bl = sim.blobs;
+  for (let i = 0; i < bl.length; i++) {
+    const a = bl[i];
+    if (!a.active || a.state !== 2 || a.partner < i) continue;
+    const c = bl[a.partner];
+    if (!c || !c.active || c.state !== 2) { a.state = 0; a.partner = -1; continue; }
+    a.mergeT -= dt; c.mergeT = a.mergeT;
+    const w1 = a.r ** 3, w2 = c.r ** 3, W = w1 + w2;
+    const cx = (a.x * w1 + c.x * w2) / W, cy = (a.y * w1 + c.y * w2) / W;
+    // slurp: both bodies converge on the volume-weighted center over t_merge
+    const lam = Math.min(1, dt / Math.max(a.mergeT, dt));
+    a.x += (cx - a.x) * lam; a.y += (cy - a.y) * lam;
+    c.x += (cx - c.x) * lam; c.y += (cy - c.y) * lam;
+    if (a.mergeT <= 0) {
+      const surv = a.r >= c.r ? a : c, gone = surv === a ? c : a;
+      surv.x = cx; surv.y = cy;
+      surv.vx = (a.vx * w1 + c.vx * w2) / W;
+      surv.vy = (a.vy * w1 + c.vy * w2) / W;
+      surv.T = (a.T * w1 + c.T * w2) / W;
+      setRadius(surv, Math.cbrt(W), C);       // #7: volume-exact
+      surv.state = 0; surv.partner = -1; surv.drainTimer = 0;
+      surv.mReady = 1;                        // k relaxes hard smoothly
+      surv.wobble = 1; surv.wobbleAge = 0;    // #9 preview ring-down
+      gone.active = false; gone.state = 0; gone.partner = -1;
+    }
+  }
+}
+
+/* Absorption into + spawning from the bottom-pool volume ledger (#5/#7 P2
+   slice: the ledger is real; pool cluster dynamics arrive in P3). */
+function absorbAndSpawn(sim, C) {
+  const S = C.sim, dt = S.dt, bl = sim.blobs;
+  for (const b of bl) {
+    if (b.active && b.aloft && b.state !== 2 &&
+        b.y < S.recycleY && b.T < S.recycleT && b.vy <= 0) {
+      b.active = false;
+      sim.poolV += b.r ** 3;
+      sim.ev.absorbs++;
+      if (b.partner >= 0 && bl[b.partner]) {
+        bl[b.partner].state = 0; bl[b.partner].partner = -1;
+      }
+      b.state = 0; b.partner = -1;
+    }
+  }
+  sim.spawnCd -= dt;
+  if (sim.spawnCd <= 0) {
+    const slot = bl.find(b => !b.active);
+    if (slot) {
+      let r = clamp(S.radiusMean * Math.exp((sim.rng() * 2 - 1) * S.radiusSpread),
+                    S.rMin, S.rMax);
+      r = Math.min(r, Math.cbrt(sim.poolV * 0.9));  // can't outdraw the ledger
+      if (r >= S.rMin) {
+        spawnInto(slot, C, sim.rng, S.floorY + 0.005);
+        setRadius(slot, r, C);
+        sim.poolV -= r ** 3;
+        sim.ev.spawns++;
+        sim.spawnCd = S.spawnCooldown;
+      }
+    }
+  }
 }
 /*SIM-END*/
 
@@ -663,20 +826,28 @@ function updateBlobs(sim, t) {
   const dt = CONFIG.sim.dt;
   const alpha = sim.alpha ?? 1;  // render interpolation between sim ticks (§8)
   for (const b of sim.blobs) {
-    const stretch = 1 + CONFIG.stretchMax *
+    if (!b.active) {  // parked far outside the vessel; SDF contribution ~0
+      for (let k = 0; k <= CONFIG.tailRadii.length; k++) put(0, -9, 0, 1e-3, 0, 0.02, 1, 0);
+      continue;
+    }
+    let stretch = 1 + CONFIG.stretchMax *
       Math.min(Math.abs(b.vy) / CONFIG.stretchVref, 1);
+    // post-merge ring-down preview (#9; proper oscillators in P4)
+    stretch *= 1 + 0.22 * b.wobble * Math.sin(2 * Math.PI * 1.3 * b.wobbleAge);
     const rx = (b.px ?? b.x) + (b.x - (b.px ?? b.x)) * alpha;
     const ry = (b.py ?? b.y) + (b.y - (b.py ?? b.y)) * alpha;
-    put(rx, ry, b.z, b.r, b.T, CONFIG.sminK, stretch, b.layer);
+    put(rx, ry, b.z, b.r, b.T, b.kNow, Math.max(stretch, 0.7), b.layer);
     for (let k = 0; k < CONFIG.tailRadii.length; k++) {
       const p = histAt(b, CONFIG.tailLagS[k], dt);
-      put(p[0], p[1], b.z, b.r * CONFIG.tailRadii[k], b.T, CONFIG.sminK * 1.6, 1, b.layer);
+      put(p[0], p[1], b.z, b.r * CONFIG.tailRadii[k], b.T, CONFIG.tailK, 1, b.layer);
     }
   }
+  // pool size tracks the volume ledger (#7: pools visibly drain/refill)
+  const poolScale = clamp(Math.cbrt(Math.max(sim.poolV, 1e-6) / CONFIG.sim.poolV0), 0.85, 1.15);
   for (const [r, x, z, yOff] of CONFIG.pool) {
     // pool breathes almost imperceptibly (#23 preview)
     const y = -0.075 + yOff + 0.006 * Math.sin(t * 0.35 + x * 20);
-    put(x, y, z, r, 0.92, CONFIG.sminK * 1.4, 1, 3);
+    put(x, y, z, r * poolScale, 0.92, CONFIG.sminK * 1.4, 1, 3);
   }
   for (const [r, x, z] of CONFIG.topPool) {
     // cold reservoir hanging under the dome (#6): dim, deep red, near-static

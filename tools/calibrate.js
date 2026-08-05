@@ -12,8 +12,13 @@ const { CONFIG, createSim, simStep } = new Function(
 )();
 
 const S = CONFIG.sim;
-const RUN_S = 960, WARM_S = 60;
+const RUN_S = Number(process.argv[3] || 960), WARM_S = 60;
 const sim = createSim(CONFIG, Number(process.argv[2] || 12345));
+
+// P2 gate: total wax Σr³ + poolV must not drift (log over the whole run)
+const totalV = () => sim.blobs.reduce((a, b) => a + (b.active ? b.r ** 3 : 0), 0) + sim.poolV;
+const v0 = totalV();
+let maxDrift = 0;
 
 // per-blob transit tracking
 const track = sim.blobs.map(() => ({ dir: 0, t0: 0, topAt: -1, hoverT: 0 }));
@@ -47,6 +52,7 @@ for (let step = 0; step < RUN_S / S.dt; step++) {
     else if (tr.hoverT > 0) { hovers.push(tr.hoverT); tr.hoverT = 0; }
   });
 
+  if (step % Math.round(10 / S.dt) === 0) maxDrift = Math.max(maxDrift, Math.abs(totalV() - v0));
   if (step % Math.round(1 / S.dt) === 0) { // 1 Hz traffic sampling
     samples++;
     const risers = sim.blobs.filter(b => b.y > 0.12 && b.y < 0.88 && b.vy > 0.003).length;
@@ -77,4 +83,9 @@ console.log(`down-return          (s): ${stats(transitsDown.map(x => x.dt))}`);
 console.log(`top hovers           (s): ${stats(hovers.filter(h => h > 1))}   [want: visible, >=3s common]`);
 console.log(`traffic: riser ${Math.round(100 * hasRiser / samples)}% | faller ${Math.round(100 * hasFaller / samples)}% | both ${Math.round(100 * hasBoth / samples)}% | avg in-flight ${(inFlightSum / samples).toFixed(1)}`);
 console.log(`mid-column turnarounds: ${midTurns.length} (mean r ${(midTurns.reduce((a, b) => a + b, 0) / (midTurns.length || 1)).toFixed(3)})`);
-console.log(`recycles: ${recycles} (${(recycles / ((RUN_S - WARM_S) / 60)).toFixed(1)}/min)`);
+// P2 gate metrics
+const mg = sim.ev.merges, coil = mg.filter(m => m.coil), free = mg.filter(m => !m.coil);
+console.log(`merges: ${mg.length} total | ${coil.length} coil-zone (instant) | ${free.length} in-flight`);
+console.log(`kiss-to-fuse delay in-flight (s): ${stats(free.map(m => m.delay))}   [expect 1-8, §11]`);
+console.log(`absorbs: ${sim.ev.absorbs} | ledger spawns: ${sim.ev.spawns} | poolV now ${(sim.poolV * 1e4).toFixed(2)}e-4`);
+console.log(`volume drift (gate: ~0): max ${maxDrift.toExponential(2)} of total ${v0.toExponential(3)} (rel ${(maxDrift / v0).toExponential(1)})`);
