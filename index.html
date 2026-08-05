@@ -74,7 +74,11 @@ const CONFIG = {
   // ---- L1 thermal blob sim (§5) — P1: free blobs, teleport-recycle in pool ----
   sim: {
     dt: 1 / 60,            // fixed sim step, wall-clock decoupled (§8)
-    nFree: 9,
+    nFree: 8,
+    // depth layers (row #26): blobs live on one of three z planes and only
+    // merge within their own layer — cross-layer passes ride behind/in front
+    layerZ: [-0.095, 0.0, 0.095],
+    layerJitter: 0.02,
     gSim: 22,              // global speed master (§5.3); calibrated via harness
     rhoLiq: 1.0, rhoWax0: 1.035, beta: 0.07,  // density crossover at T ≈ 0.483
     cV: 2.0, cH: 3.2,      // anisotropic drag (vertical/horizontal)
@@ -191,14 +195,24 @@ float smin(float a, float b, float k) {
 }
 
 float sdWax(vec3 p) {
-  float d = 1e5;
+  // depth layers (row #26): smin only within a layer; layers meet with a
+  // tiny-k smin (reads as film contact, not fusion). uBlobB.w = layer,
+  // 3.0 = pools, which merge with every layer.
+  vec3 dl = vec3(1e5);
   for (int i = 0; i < NBLOB; i++) {
     // uBlobB[i].z = vertical stretch (L2 ellipsoid, #8); gradient stays <= 1 for s >= 1
     vec3 q = p - uBlobA[i].xyz;
     q.y /= uBlobB[i].z;
     float di = length(q) - uBlobA[i].w;
-    d = smin(d, di, uBlobB[i].y);
+    float k = uBlobB[i].y;
+    float layer = uBlobB[i].w;
+    if (layer > 2.5) {
+      dl.x = smin(dl.x, di, k); dl.y = smin(dl.y, di, k); dl.z = smin(dl.z, di, k);
+    } else if (layer > 1.5) dl.z = smin(dl.z, di, k);
+    else if (layer > 0.5) dl.y = smin(dl.y, di, k);
+    else dl.x = smin(dl.x, di, k);
   }
+  float d = smin(smin(dl.x, dl.y, 0.014), dl.z, 0.014);
   // pool floor + liquid ceiling: wax stays inside the fluid column
   d = max(d, GLASS_Y0 - 0.02 - p.y);
   d = max(d, p.y - ${f(CONFIG.ceilY)});
@@ -552,7 +566,8 @@ function kZoneAt(y, S) {
 function spawnInto(b, C, rng, y0) {
   const S = C.sim;
   b.r = clamp(S.radiusMean * Math.exp((rng() * 2 - 1) * S.radiusSpread), S.rMin, S.rMax);
-  b.z = (rng() * 2 - 1) * 0.28 * C.glassRadius;
+  b.layer = Math.floor(rng() * S.layerZ.length);
+  b.z = S.layerZ[b.layer] + (rng() * 2 - 1) * S.layerJitter;
   const lim = C.glassRadius - b.r - S.wallMargin;
   b.xMax = Math.sqrt(Math.max(lim * lim - b.z * b.z, 1e-4));
   b.x = (rng() * 2 - 1) * b.xMax * 0.8;
@@ -640,9 +655,9 @@ function histAt(b, lagS, dt) {
 
 function updateBlobs(sim, t) {
   let i = 0;
-  const put = (x, y, z, r, T, k, stretch) => {
+  const put = (x, y, z, r, T, k, stretch, layer) => {
     blobA.set([x, y, z, r], i * 4);
-    blobB.set([T, k, stretch, 0], i * 4);
+    blobB.set([T, k, stretch, layer], i * 4);
     i++;
   };
   const dt = CONFIG.sim.dt;
@@ -652,21 +667,21 @@ function updateBlobs(sim, t) {
       Math.min(Math.abs(b.vy) / CONFIG.stretchVref, 1);
     const rx = (b.px ?? b.x) + (b.x - (b.px ?? b.x)) * alpha;
     const ry = (b.py ?? b.y) + (b.y - (b.py ?? b.y)) * alpha;
-    put(rx, ry, b.z, b.r, b.T, CONFIG.sminK, stretch);
+    put(rx, ry, b.z, b.r, b.T, CONFIG.sminK, stretch, b.layer);
     for (let k = 0; k < CONFIG.tailRadii.length; k++) {
       const p = histAt(b, CONFIG.tailLagS[k], dt);
-      put(p[0], p[1], b.z, b.r * CONFIG.tailRadii[k], b.T, CONFIG.sminK * 1.6, 1);
+      put(p[0], p[1], b.z, b.r * CONFIG.tailRadii[k], b.T, CONFIG.sminK * 1.6, 1, b.layer);
     }
   }
   for (const [r, x, z, yOff] of CONFIG.pool) {
     // pool breathes almost imperceptibly (#23 preview)
     const y = -0.075 + yOff + 0.006 * Math.sin(t * 0.35 + x * 20);
-    put(x, y, z, r, 0.92, CONFIG.sminK * 1.4, 1);
+    put(x, y, z, r, 0.92, CONFIG.sminK * 1.4, 1, 3);
   }
   for (const [r, x, z] of CONFIG.topPool) {
     // cold reservoir hanging under the dome (#6): dim, deep red, near-static
     const y = CONFIG.topPoolY + 0.005 * Math.sin(t * 0.27 + x * 17);
-    put(x, y, z, r, 0.22, CONFIG.sminK * 1.5, 1);
+    put(x, y, z, r, 0.22, CONFIG.sminK * 1.5, 1, 3);
   }
 }
 

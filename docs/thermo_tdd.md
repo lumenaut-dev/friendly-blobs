@@ -94,6 +94,7 @@ Understanding what we're faking, so mechanisms have named targets:
 | 23 | Nothing is ever static: pool breathes, dome shimmers | Micro-convection | Low-amplitude time-noise on pool cluster positions and smin k | L2 | A | High | P5 |
 | 24 | Tap-the-glass wobble | Impulse through vessel | Radial impulse to nearby blobs + brief camera-space vessel shudder; excites #9 oscillators | L1 | A | High | P4 |
 | 25 | Coil at base aiding re-merge | Coil breaks film of returned blobs | Bottom zone sets drainage timer → ~0 (instant merge eligibility) | L1 | A | Exact | P2 |
+| 26 | Depth-ambiguous traffic: blobs pass in front of / behind each other without fusing; implied front/back circulation loop | Full 3D motion in a cylinder viewed from one side | 3 fixed depth layers (z planes within ±0.4R); smin only within a layer, near-hard min across layers (tiny k reads as film contact, previews #3); pools span all layers; perspective + liquid fog give free depth cues | L1+L3 | A | Med-High | P1 |
 
 **Audit rule:** any time footage comparison reveals a behavior not in this table, add a row before writing code for it.
 
