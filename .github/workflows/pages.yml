@@ -1,5 +1,11 @@
 name: Deploy to GitHub Pages
 
+# The site serves from the gh-pages branch (legacy Pages build). Every push
+# to a dev branch mirrors the tree to gh-pages, which triggers the Pages
+# build automatically. We deploy this way instead of actions/deploy-pages
+# because the github-pages environment was auto-pinned to gh-pages when the
+# site was created, and GITHUB_TOKEN cannot edit environment policies.
+
 on:
   push:
     branches:
@@ -8,27 +14,16 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
 concurrency:
   group: pages
   cancel-in-progress: true
 
 jobs:
-  deploy:
+  publish:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/configure-pages@v5
-        with:
-          enablement: true
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: .
-      - id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Mirror to gh-pages
+        run: git push --force origin HEAD:gh-pages

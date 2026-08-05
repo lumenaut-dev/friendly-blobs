@@ -30,7 +30,8 @@ per the phase plan. Blob motion is scripted sine paths — L1 sim lands in P1.
 ## Dev notes
 
 - Open `index.html` directly, or visit the Pages URL. Every push to `main` or
-  `claude/**` redeploys Pages automatically.
+  `claude/**` mirrors the tree to the `gh-pages` branch, which GitHub Pages
+  serves — don't commit to `gh-pages` by hand, it gets force-overwritten.
 - `?ts=N` URL param scales time (e.g. `?ts=10`) to preview slow behaviors fast.
   Real transit periods are 70–150 s by design — slowness is the point (TDD §5.3).
 - All constants live in the `CONFIG` object at the top of `index.html`; never
