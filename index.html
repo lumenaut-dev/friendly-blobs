@@ -73,21 +73,39 @@ const CONFIG = {
   // ---- P0 scripted blob paths (replaced by L1 in P1) ----
   // movers: [radius, x0, zJitter, periodSec, phase, lateralAmp]
   movers: [
-    [0.095, -0.060,  0.050, 130, 0.0, 0.030],
-    [0.075,  0.080, -0.060,  95, 2.0, 0.028],
-    [0.060, -0.110, -0.030,  78, 4.1, 0.022],
-    [0.085,  0.030,  0.065, 110, 1.1, 0.030],
-    [0.055,  0.120,  0.020,  70, 5.0, 0.018],
-    [0.070, -0.020, -0.070,  88, 3.2, 0.026],
+    [0.095, -0.060,  0.050, 170, 0.0, 0.030],
+    [0.075,  0.080, -0.060, 125, 2.0, 0.028],
+    [0.060, -0.110, -0.030, 105, 4.1, 0.022],
+    [0.085,  0.030,  0.065, 145, 1.1, 0.030],
+    [0.055,  0.120,  0.020,  92, 5.0, 0.018],
+    [0.070, -0.020, -0.070, 115, 3.2, 0.026],
   ],
+  dwellPow: 0.62,          // <1 → long hover at turnarounds, quicker mid-column (#1 fake)
+  // trailing-neck tails (#8 P0 fake): each mover drags sources that lag its
+  // own path — neck length scales with speed automatically, taper via radii
+  tailLagFrac: 0.030,      // lag = period * frac (seconds)
+  tailLagMul: [1.0, 1.9],
+  tailRadii:  [0.60, 0.36],
+  stretchMax: 0.45,        // velocity elongation cap (#8)
+  stretchVref: 0.016,
   // bottom pool dome: two pinned spheres, smin does the rest (stand-in for §6.2)
   pool: [
     [0.155, -0.085, -0.075, 0.01],
     [0.150,  0.085, -0.080, -0.02],
   ],
+  // top reservoir (#6 P0 fake): cold mass hanging under the dome; movers'
+  // paths end inside it so detachment/absorption necks come free from smin
+  topPool: [
+    [0.135, -0.100, -0.050],
+    [0.125,  0.020,  0.060],
+    [0.115,  0.105, -0.040],
+  ],
+  topPoolY: 1.025,
+  ceilY: 0.985,            // liquid ceiling clamp — flattens the reservoir top
 };
 
-const NBLOB = CONFIG.movers.length + CONFIG.pool.length;
+const NBLOB = CONFIG.movers.length * (1 + CONFIG.tailRadii.length) +
+              CONFIG.pool.length + CONFIG.topPool.length;
 
 const qs = new URLSearchParams(location.search);
 if (qs.has("ts")) CONFIG.timeScale = parseFloat(qs.get("ts")) || 1.0;
@@ -147,11 +165,15 @@ float smin(float a, float b, float k) {
 float sdWax(vec3 p) {
   float d = 1e5;
   for (int i = 0; i < NBLOB; i++) {
-    float di = length(p - uBlobA[i].xyz) - uBlobA[i].w;
+    // uBlobB[i].z = vertical stretch (L2 ellipsoid, #8); gradient stays <= 1 for s >= 1
+    vec3 q = p - uBlobA[i].xyz;
+    q.y /= uBlobB[i].z;
+    float di = length(q) - uBlobA[i].w;
     d = smin(d, di, uBlobB[i].y);
   }
-  // pool floor: clamp wax to sit on vessel bottom
+  // pool floor + liquid ceiling: wax stays inside the fluid column
   d = max(d, GLASS_Y0 - 0.02 - p.y);
+  d = max(d, p.y - ${f(CONFIG.ceilY)});
   return d;
 }
 
@@ -468,28 +490,55 @@ const uBlobB = gl.getUniformLocation(prog, "uBlobB");
 const blobA = new Float32Array(NBLOB * 4);
 const blobB = new Float32Array(NBLOB * 4);
 
-/* P0 scripted paths (§12 P0): sine verticals at real-lamp transit periods,
-   light lateral sway, fixed z-jitter. Replaced wholesale by L1 in P1. */
+/* P0 scripted paths (§12 P0): dwell-shaped sine verticals running pool to
+   pool, lagging tail sources for trailing necks, velocity stretch.
+   Replaced wholesale by L1 in P1. */
+
+// dwell-shaped oscillation: |sin|^p with p<1 lingers at extremes (turnaround
+// hover, #1) and moves quickest mid-column
+function moverPos(m, t) {
+  const [r, x0, z, period, phase, lat] = m;
+  const w = (2 * Math.PI) / period;
+  const s = Math.sin(w * t + phase);
+  const y = 0.5 + 0.5 * Math.sign(s) * Math.pow(Math.abs(s), CONFIG.dwellPow);
+  let x = x0 + lat * Math.sin(w * 2.7 * t + phase * 1.7);
+  const maxX = CONFIG.glassRadius - r - 0.015;
+  x = Math.max(-maxX, Math.min(maxX, x));
+  return [x, y, z];
+}
+
 function updateBlobs(t) {
-  const R = CONFIG.glassRadius;
   let i = 0;
-  for (const [r, x0, z, period, phase, lat] of CONFIG.movers) {
-    const w = (2 * Math.PI) / period;
-    const y = 0.5 + 0.42 * Math.sin(w * t + phase);
-    let x = x0 + lat * Math.sin(w * 2.7 * t + phase * 1.7);
-    const maxX = R - r - 0.015;
-    x = Math.max(-maxX, Math.min(maxX, x));
-    const T = Math.max(0.05, Math.min(1.0, 1.15 - 1.3 * y)); // hot low, cold high
-    blobA.set([x, y, z, r], i * 4);
-    blobB.set([T, CONFIG.sminK, 0, 0], i * 4);
+  const put = (pos, r, T, k, stretch) => {
+    blobA.set([pos[0], pos[1], pos[2], r], i * 4);
+    blobB.set([T, k, stretch, 0], i * 4);
     i++;
+  };
+  for (const m of CONFIG.movers) {
+    const r = m[0], period = m[3];
+    const p0 = moverPos(m, t);
+    const T = Math.max(0.05, Math.min(1.0, 1.15 - 1.3 * p0[1])); // hot low, cold high
+    // velocity → elongation (#8)
+    const vy = (p0[1] - moverPos(m, t - 0.5)[1]) / 0.5;
+    const stretch = 1 + CONFIG.stretchMax * Math.min(Math.abs(vy) / CONFIG.stretchVref, 1);
+    put(p0, r, T, CONFIG.sminK, stretch);
+    // trailing tails: lag the same path — the neck stretches with speed and
+    // gets reabsorbed while hovering, all through smin
+    const lag = period * CONFIG.tailLagFrac;
+    for (let k = 0; k < CONFIG.tailRadii.length; k++) {
+      const pt = moverPos(m, t - lag * CONFIG.tailLagMul[k]);
+      put(pt, r * CONFIG.tailRadii[k], T, CONFIG.sminK * 1.6, 1);
+    }
   }
   for (const [r, x, z, yOff] of CONFIG.pool) {
     // pool breathes almost imperceptibly (#23 preview)
     const y = -0.075 + yOff + 0.006 * Math.sin(t * 0.35 + x * 20);
-    blobA.set([x, y, z, r], i * 4);
-    blobB.set([0.92, CONFIG.sminK * 1.4, 0, 0], i * 4);
-    i++;
+    put([x, y, z], r, 0.92, CONFIG.sminK * 1.4, 1);
+  }
+  for (const [r, x, z] of CONFIG.topPool) {
+    // cold reservoir hanging under the dome (#6): dim, deep red, near-static
+    const y = CONFIG.topPoolY + 0.005 * Math.sin(t * 0.27 + x * 17);
+    put([x, y, z], r, 0.22, CONFIG.sminK * 1.5, 1);
   }
 }
 
