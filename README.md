@@ -16,8 +16,8 @@ let a raymarched SDF renderer manufacture the *appearance* of fluidity.
 | **P0 — Renderer proof** | screenshot makes you say "oh" | **passed** (session 2/7) — reads as wax, not metaballs |
 | **P1 — Thermal circulation** | 15 min unattended mixed traffic | **passed** (session 3) — harness-verified, see `tools/calibrate.js` |
 | **P2 — Merge/drainage + volume ledger** | kiss-hesitate-fuse; no volume drift | **passed** (session 4) — drift ~3e-16 over 31 min; fuse delays 2.6–4.7 s |
-| **P3 — Pools + detachment + pendant** | full self-priming cycle | **next up** |
-| P4 — Interaction | heat-cursor feels caused, not commanded | not started |
+| **P3 — Pools + detachment + pendant** | full self-priming cycle | **passed** (session 5) — cold start primes in ~3 min sim; §6.2 de-scope valve taken |
+| **P4 — Interaction** | heat-cursor feels caused, not commanded | **next up** |
 | P5 — Polish & calibration | blind test ≤ 75% | not started |
 | P6 — Godot port | budget table §8 on UHD 770 | not started |
 
@@ -41,6 +41,19 @@ the renderer), coil-zone instant re-merge (#25), and the bottom-pool volume
 ledger (#7): absorption deposits r³, spawns withdraw it, merges are
 volume-exact — total wax is conserved to float epsilon. Depth layers don't
 merge (#26). Pool visual scales with the ledger. Wobble is a stub (#9, P4).
+
+P3 scope shipped: pools are real state machines (§5.5). Bottom pool: coil
+heats pool T, a melt accumulator banks volume and releases blobs born hot
+with a detachment impulse after a visible pre-release bulge (#5); size from
+the lognormal distribution, capped by the ledger. Top pool: blobs loitering
+near the dome deposit their volume incrementally (melts-in over ~1.2 s),
+the pool cools toward ambient, and when cold + full it extrudes a pendant
+that necks, pinches (#4), and falls (#6). The reservoir literally grows from
+nothing on a cold start. True cold start (`?cold=1`): all wax pooled, first
+detach ~60 s, full cycle primed ~3 min; pages pre-roll 180 s by default.
+Cluster rendering intentionally uses the §6.2 de-scope valve (procedural
+primitives + animated bulge/pendant spheres) — sub-particle clusters can
+land in P5 polish if footage comparison demands them.
 
 Hard-won tuning invariant (P1): everywhere above the pool-stick zone the net
 thermal drive must be negative (cooling wins). Any altitude where bulb heating

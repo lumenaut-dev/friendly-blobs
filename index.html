@@ -22,7 +22,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="tag">PROJECT THERMO · P2 merge/drainage · volume ledger live</div>
+<div id="tag">PROJECT THERMO · P3 pools · self-priming melt cycle live</div>
 <div id="err"></div>
 <script>
 "use strict";
@@ -99,13 +99,25 @@ const CONFIG = {
     kBulb: 0.12, bulbSigma: 0.13, bulbCutLo: 0.03, bulbCutHi: 0.10,
     // detachment size distribution (row #2: size diversity → phase diversity)
     radiusMean: 0.062, radiusSpread: 0.35, rMin: 0.042, rMax: 0.095,
-    spawnTMin: 0.24, spawnTMax: 0.36,  // spawn cool → heats in pool → lifts off
-    // pool sticking (row #5 P1-lite): wax clings to the pool until hot enough,
-    // so blobs detach hot and rise decisively instead of crawling off lukewarm
-    poolStickY: 0.05, detachTBase: 0.84, detachTSpread: 0.10,
-    recycleY: 0.03, recycleT: 0.45,    // cold blob sinking into pool is absorbed
+    recycleY: 0.075,       // pool surface: cold sinkers below this are absorbed
     floorY: 0.012, wallMargin: 0.012,
     seedJitter: 0.10,      // ±10% per-blob param noise (row #2)
+    // ---- P3: pools with melt accumulator + pendant release (§5.5) ----
+    waxTotal: 2.2e-3,      // total wax in the lamp (lamp units³) — invariant
+    poolBT0: 0.30, poolTT0: 0.20,     // cold-start pool temperatures
+    kPoolHeat: 0.04, poolTHot: 0.95,  // bottom pool heats toward the coil temp
+    kTopPoolCool: 0.05,               // top pool cools toward T_amb(top)
+    kMeltRate: 5e-5,       // melt accumulator fill per (T - TMelt) per second
+    tBulge: 3.0,           // pool bulges visibly before release (#5)
+    jDetach: 0.04,         // detachment impulse — "decisive, not sluggish" (§10)
+    domeCatch: 0.12, tauDome: 5.0,  // loitering within reach of the dome for
+                                    // tauDome seconds → deposit into top pool (#6)
+    tAbsorbTop: 1.2,       // blob melts into the top pool over this long
+    pendantVmin: 2.0e-4,   // top pool volume needed before a pendant drips
+    tPendant: 4.0, jPendant: 0.01,       // pendant extrusion time + release nudge
+    poolBRef: 1.1e-3, poolTRef: 0.77e-3, // ledger volumes at nominal visual scale
+    poolBMinScale: 0.6,    // residual wax film — bottom pool never vanishes
+    warmStart: 180,        // pre-roll seconds at load (?cold=1 for true cold start)
     // ---- P2: merge/drainage state machine (§5.4) + volume ledger (#7) ----
     contactEps: 0.01,
     kFilm: 4.0,            // film pressure — soft repulsion while draining
@@ -117,8 +129,6 @@ const CONFIG = {
     kHard: 0.018, kSoft: 0.085,   // per-blob smin driven by merge readiness
     kLerpRate: 6.0,
     rMaxMerge: 0.105,      // film persists if fusion would exceed this radius
-    poolV0: 5e-4,          // bottom-pool volume ledger seed (lamp units³)
-    spawnCooldown: 4.0,    // min seconds between ledger spawns
   },
   tailK: 0.07,             // tail smin softness (necks stay soft vs hard blobs)
   // L2-lite: trailing necks from position history + velocity stretch (#8).
@@ -146,7 +156,7 @@ const CONFIG = {
 /*CONFIG-END*/
 
 const NBLOB = CONFIG.sim.nFree * (1 + CONFIG.tailRadii.length) +
-              CONFIG.pool.length + CONFIG.topPool.length;
+              CONFIG.pool.length + CONFIG.topPool.length + 2; // +bulge +pendant
 
 const qs = new URLSearchParams(location.search);
 if (qs.has("ts")) CONFIG.timeScale = parseFloat(qs.get("ts")) || 1.0;
@@ -588,8 +598,7 @@ function spawnInto(b, C, rng, y0) {
   b.y = y0;
   b.vx = 0; b.vy = 0;
   b.aloft = false;  // set once the blob has genuinely flown; gates absorption
-  b.T = S.spawnTMin + rng() * (S.spawnTMax - S.spawnTMin);
-  b.detachT = S.detachTBase + rng() * S.detachTSpread;
+  b.T = 0.5;        // caller overrides: detached blobs are born at pool T
   b.seed = 1 + (rng() * 2 - 1) * S.seedJitter;
   b.hist = [];            // position history for L2 tails — reset on spawn
   // §5.4 state machine fields
@@ -613,20 +622,27 @@ function setRadius(b, r, C) {
 function createSim(C, seed) {
   const rng = mulberry32(seed);
   const blobs = [];
+  // §5.5 self-priming cold start: ALL wax begins in the bottom pool ledger.
+  // The melt model produces the first detachment; nothing is scattered.
   for (let i = 0; i < C.sim.nFree; i++) {
     const b = spawnInto({}, C, rng, C.sim.floorY + 0.005);
-    // prime mixed traffic: scatter initial heights/temps/velocities (§5.5
-    // traffic guarantee arrives with real pools in P3; this is the P1 stand-in)
-    if (i % 3 === 1) { b.y = 0.2 + rng() * 0.55; b.T = 0.55 + rng() * 0.25; }
-    if (i % 3 === 2) { b.y = 0.6 + rng() * 0.3;  b.T = 0.25 + rng() * 0.2; }
+    b.active = false;
     blobs.push(b);
   }
   return {
     blobs, rng, t: 0,
-    poolV: C.sim.poolV0,   // #7 ledger: total wax Σr³ + poolV is invariant
-    spawnCd: 0,
-    ev: { merges: [], absorbs: 0, spawns: 0 },  // event log (harness + debug)
+    poolB: { V: C.sim.waxTotal, T: C.sim.poolBT0, meltAccum: 0,
+             bulge: 0, bulgeX: 0, bulgeZ: 0, bulgeLayer: 1, nextR: 0 },
+    poolT: { V: 0, T: C.sim.poolTT0,
+             pendant: 0, pendantX: 0, pendantZ: 0, pendantLayer: 1, nextR: 0 },
+    ev: { merges: [], absorbsTop: 0, absorbsBottom: 0, detaches: 0, pendants: 0 },
   };
+}
+
+function sampleR(sim, S, capV) {
+  let r = clamp(S.radiusMean * Math.exp((sim.rng() * 2 - 1) * S.radiusSpread),
+                S.rMin, S.rMax);
+  return Math.min(r, Math.cbrt(Math.max(capV, 0) * 0.8));
 }
 
 function simStep(sim, C) {
@@ -646,8 +662,6 @@ function simStep(sim, C) {
     const rhoWax = S.rhoWax0 * (1 - S.beta * b.T);
     let ab = S.gSim * b.seed * (S.rhoLiq - rhoWax) / rhoWax;
     if (ab > 0) ab *= Math.sqrt(b.melt);  // melt gates rising, not sinking
-    // pool sticking: cling to the pool until hot enough to detach (#5 lite)
-    if (b.y < S.poolStickY && b.T < b.detachT) ab = Math.min(ab, 0);
     const ay = ab - (S.cV * b.vy) / b.r;
     const ax = -(S.cH * b.vx) / b.r;
 
@@ -674,7 +688,7 @@ function simStep(sim, C) {
 
   contactPass(sim, C);
   mergePass(sim, C);
-  absorbAndSpawn(sim, C);
+  poolPass(sim, C);
 
   for (const b of sim.blobs) {
     if (!b.active) continue;
@@ -772,38 +786,128 @@ function mergePass(sim, C) {
   }
 }
 
-/* Absorption into + spawning from the bottom-pool volume ledger (#5/#7 P2
-   slice: the ledger is real; pool cluster dynamics arrive in P3). */
-function absorbAndSpawn(sim, C) {
+/* §5.5 pools: melt-accumulator detachment (bottom, #5), dome absorption and
+   pendant drips (top, #6), both against exact volume ledgers (#7). */
+function poolPass(sim, C) {
   const S = C.sim, dt = S.dt, bl = sim.blobs;
+  const PB = sim.poolB, PT = sim.poolT;
+
+  // ---- bottom pool: coil heats it; melt accumulates; bulge then release ----
+  PB.T = clamp(PB.T + S.kPoolHeat * (S.poolTHot - PB.T) * dt, 0, 1);
+  PB.meltAccum = Math.min(PB.meltAccum + S.kMeltRate * Math.max(PB.T - S.TMelt, 0) * dt,
+                          8e-4);  // capped: waiting must not bank a burst
+  if (PB.nextR === 0) {
+    const r = sampleR(sim, S, PB.V);
+    if (r >= S.rMin) {
+      PB.nextR = r;
+      PB.bulgeX = (sim.rng() * 2 - 1) * 0.10;
+      PB.bulgeLayer = Math.floor(sim.rng() * S.layerZ.length);
+      PB.bulgeZ = S.layerZ[PB.bulgeLayer] + (sim.rng() * 2 - 1) * S.layerJitter;
+    }
+  }
+  const need = PB.nextR > 0 ? PB.nextR ** 3 : Infinity;
+  if (PB.nextR > 0 && PB.meltAccum >= need && PB.V >= need) {
+    PB.bulge = Math.min(PB.bulge + dt / S.tBulge, 1);   // pool swells first (#5)
+    if (PB.bulge >= 1) {
+      const slot = bl.find(b => !b.active);
+      if (slot) {
+        spawnInto(slot, C, sim.rng, S.floorY + 0.01);
+        slot.layer = PB.bulgeLayer; slot.z = PB.bulgeZ;
+        setRadius(slot, PB.nextR, C);
+        slot.x = clamp(PB.bulgeX, -slot.xMax, slot.xMax);
+        slot.T = PB.T; slot.melt = 1;
+        slot.vy = S.jDetach;                            // decisive kick (§10)
+        slot.wobble = 0.7; slot.wobbleAge = 0;
+        PB.V -= need; PB.meltAccum -= need;
+        PB.nextR = 0; PB.bulge = 0;
+        sim.ev.detaches++;
+      }
+      // no free slot: hold the bulge; releases resume when traffic returns
+    }
+  } else {
+    PB.bulge = Math.max(PB.bulge - dt / 0.4, 0);
+  }
+
+  // ---- top pool: cools toward the dome; drips pendants when cold + full ----
+  PT.T = clamp(PT.T + S.kTopPoolCool * (S.TambTop - PT.T) * dt, 0, 1);
+  const TCross = 0.483;
+  if (PT.pendant === 0 && PT.T < TCross && PT.V > S.pendantVmin) {
+    const r = sampleR(sim, S, PT.V);
+    if (r >= S.rMin) {
+      PT.nextR = r;
+      PT.pendantLayer = Math.floor(sim.rng() * S.layerZ.length);
+      PT.pendantZ = S.layerZ[PT.pendantLayer] + (sim.rng() * 2 - 1) * S.layerJitter;
+      const t3 = C.topPool[Math.floor(sim.rng() * C.topPool.length)];
+      PT.pendantX = t3[1] + (sim.rng() * 2 - 1) * 0.03;
+      PT.pendant = 1e-4;   // start extruding
+    }
+  }
+  if (PT.pendant > 0 && PT.nextR > 0) {
+    PT.pendant = Math.min(PT.pendant + dt / S.tPendant, 1);
+    if (PT.pendant >= 1) {
+      const slot = bl.find(b => !b.active);
+      if (slot) {
+        spawnInto(slot, C, sim.rng, 0.90 - PT.nextR * 2.0);
+        slot.layer = PT.pendantLayer; slot.z = PT.pendantZ;
+        setRadius(slot, PT.nextR, C);
+        slot.x = clamp(PT.pendantX, -slot.xMax, slot.xMax);
+        slot.T = PT.T; slot.aloft = true;    // it is already aloft, may be absorbed below
+        slot.vy = -S.jPendant;
+        slot.wobble = 0.5; slot.wobbleAge = 0;
+        PT.V -= PT.nextR ** 3;
+        PT.nextR = 0; PT.pendant = 0;
+        sim.ev.pendants++;
+      }
+    }
+  }
+
+  // ---- free-blob ⇄ pool exchange ----
   for (const b of bl) {
-    if (b.active && b.aloft && b.state !== 2 &&
-        b.y < S.recycleY && b.T < S.recycleT && b.vy <= 0) {
-      b.active = false;
-      sim.poolV += b.r ** 3;
-      sim.ev.absorbs++;
-      if (b.partner >= 0 && bl[b.partner]) {
-        bl[b.partner].state = 0; bl[b.partner].partner = -1;
+    if (!b.active || b.state === 2) continue;
+    // top: sustained dome press → melt into the reservoir over tAbsorbTop
+    const yTop = C.ceilY - 0.03 - b.r * 0.55;
+    if (b.y > yTop - S.domeCatch && Math.abs(b.vy) < 0.004) {
+      b.domeTimer = (b.domeTimer || 0) + dt;
+    } else if (!b.absorbing) {
+      b.domeTimer = Math.max((b.domeTimer || 0) - dt * 2, 0);
+    }
+    if (!b.absorbing && b.domeTimer > S.tauDome) {
+      b.absorbing = { v0: b.r ** 3, p: 0 };   // exact incremental transfer
+    }
+    if (b.absorbing) {
+      const dp = Math.min(dt / S.tAbsorbTop, 1 - b.absorbing.p);
+      b.absorbing.p += dp;
+      const moved = b.absorbing.v0 * dp;
+      PT.T = (PT.T * PT.V + b.T * moved) / Math.max(PT.V + moved, 1e-9);
+      PT.V += moved;
+      b.r = Math.cbrt(Math.max(b.absorbing.v0 * (1 - b.absorbing.p), 1e-12));
+      b.y += 0.02 * dt / S.tAbsorbTop;        // drawn up into the mass
+      if (b.absorbing.p >= 1) {
+        deactivate(b, bl);
+        sim.ev.absorbsTop++;
       }
-      b.state = 0; b.partner = -1;
+      continue;
+    }
+    // bottom: a cold sinking blob is absorbed at the pool SURFACE (~dome
+    // height), before the near-floor reheat zone can flip it buoyant again —
+    // otherwise it creeps at the crossover and bounces forever (see README
+    // invariant). Coil breaks the film, so absorption is instant (#25).
+    if (b.aloft && b.y < S.recycleY && b.vy < -0.0005 && b.T < 0.45) {
+      PB.T = (PB.T * PB.V + b.T * b.r ** 3) / Math.max(PB.V + b.r ** 3, 1e-9);
+      PB.V += b.r ** 3;
+      deactivate(b, bl);
+      sim.ev.absorbsBottom++;
     }
   }
-  sim.spawnCd -= dt;
-  if (sim.spawnCd <= 0) {
-    const slot = bl.find(b => !b.active);
-    if (slot) {
-      let r = clamp(S.radiusMean * Math.exp((sim.rng() * 2 - 1) * S.radiusSpread),
-                    S.rMin, S.rMax);
-      r = Math.min(r, Math.cbrt(sim.poolV * 0.9));  // can't outdraw the ledger
-      if (r >= S.rMin) {
-        spawnInto(slot, C, sim.rng, S.floorY + 0.005);
-        setRadius(slot, r, C);
-        sim.poolV -= r ** 3;
-        sim.ev.spawns++;
-        sim.spawnCd = S.spawnCooldown;
-      }
-    }
+}
+
+function deactivate(b, bl) {
+  b.active = false;
+  b.absorbing = null; b.domeTimer = 0;
+  if (b.partner >= 0 && bl[b.partner]) {
+    bl[b.partner].state = 0; bl[b.partner].partner = -1;
   }
+  b.state = 0; b.partner = -1;
 }
 /*SIM-END*/
 
@@ -842,18 +946,35 @@ function updateBlobs(sim, t) {
       put(p[0], p[1], b.z, b.r * CONFIG.tailRadii[k], b.T, CONFIG.tailK, 1, b.layer);
     }
   }
-  // pool size tracks the volume ledger (#7: pools visibly drain/refill)
-  const poolScale = clamp(Math.cbrt(Math.max(sim.poolV, 1e-6) / CONFIG.sim.poolV0), 0.85, 1.15);
+  // pool sizes track the volume ledgers (#7: pools visibly drain/refill)
+  const S = CONFIG.sim, PB = sim.poolB, PT = sim.poolT;
+  const bScale = Math.max(Math.cbrt(PB.V / S.poolBRef), S.poolBMinScale);
   for (const [r, x, z, yOff] of CONFIG.pool) {
     // pool breathes almost imperceptibly (#23 preview)
     const y = -0.075 + yOff + 0.006 * Math.sin(t * 0.35 + x * 20);
-    put(x, y, z, r * poolScale, 0.92, CONFIG.sminK * 1.4, 1, 3);
+    put(x, y, z, r * bScale, PB.T, CONFIG.sminK * 1.4, 1, 3);
   }
+  // top reservoir grows from nothing as blobs deposit (#6, self-priming)
+  const tScale = Math.min(Math.cbrt(PT.V / S.poolTRef), 1.15);
   for (const [r, x, z] of CONFIG.topPool) {
-    // cold reservoir hanging under the dome (#6): dim, deep red, near-static
     const y = CONFIG.topPoolY + 0.005 * Math.sin(t * 0.27 + x * 17);
-    put(x, y, z, r, 0.22, CONFIG.sminK * 1.5, 1, 3);
+    if (tScale < 0.05) { put(0, -9, 0, 1e-3, 0, 0.02, 1, 0); continue; }
+    put(x, y, z, r * tScale, PT.T, CONFIG.sminK * 1.5, 1, 3);
   }
+  // pre-release bulge (#5): the pool swells at the release point, then the
+  // spawned blob takes over at exactly this position — seamless handoff
+  if (PB.bulge > 0.01 && PB.nextR > 0) {
+    const br = PB.nextR * (0.35 + 0.65 * PB.bulge);
+    const by = S.floorY + 0.01 + PB.bulge * PB.nextR * 0.8;
+    put(PB.bulgeX, by, PB.bulgeZ, br, PB.T, CONFIG.sminK * 1.4, 1, 3);
+  } else put(0, -9, 0, 1e-3, 0, 0.02, 1, 0);
+  // pendant drop (#6): extrudes down from the dome; smin thins the neck and
+  // the spawned faller pinches it off (#4, visual-only and free)
+  if (PT.pendant > 0 && PT.nextR > 0) {
+    const pr = PT.nextR * (0.4 + 0.6 * PT.pendant);
+    const py = 0.94 - PT.pendant * PT.nextR * 2.0;
+    put(PT.pendantX, py, PT.pendantZ, pr, PT.T, CONFIG.sminK * 1.3, 1, 3);
+  } else put(0, -9, 0, 1e-3, 0, 0.02, 1, 0);
 }
 
 function resize() {
@@ -869,6 +990,12 @@ function resize() {
 window.addEventListener("resize", resize);
 
 const sim = createSim(CONFIG, 0xC0FFEE);
+// §5.5 self-priming: the sim starts truly cold (all wax pooled). Pre-roll so
+// the page opens mid-circulation; ?cold=1 shows the real warm-up from zero.
+if (!qs.has("cold")) {
+  const preSteps = Math.round(CONFIG.sim.warmStart / CONFIG.sim.dt);
+  for (let i = 0; i < preSteps; i++) simStep(sim, CONFIG);
+}
 let acc = 0;
 let last = performance.now();
 function frame(now) {

@@ -15,10 +15,13 @@ const S = CONFIG.sim;
 const RUN_S = Number(process.argv[3] || 960), WARM_S = 60;
 const sim = createSim(CONFIG, Number(process.argv[2] || 12345));
 
-// P2 gate: total wax Σr³ + poolV must not drift (log over the whole run)
-const totalV = () => sim.blobs.reduce((a, b) => a + (b.active ? b.r ** 3 : 0), 0) + sim.poolV;
+// P2 gate: total wax Σr³ + pool ledgers must not drift (log over the run)
+const totalV = () => sim.blobs.reduce((a, b) => a + (b.active ? b.r ** 3 : 0), 0) +
+                     sim.poolB.V + sim.poolT.V;
 const v0 = totalV();
 let maxDrift = 0;
+// P3 gate: self-priming from cold start — record first-event times
+const firsts = { detach: -1, absorbTop: -1, pendant: -1, absorbBottom: -1 };
 
 // per-blob transit tracking
 const track = sim.blobs.map(() => ({ dir: 0, t0: 0, topAt: -1, hoverT: 0 }));
@@ -40,8 +43,8 @@ for (let step = 0; step < RUN_S / S.dt; step++) {
     const tr = track[i];
     // upward transit: cross 0.12 rising → reach 0.88
     if (tr.dir <= 0 && prevY[i] < 0.12 && b.y >= 0.12 && b.vy > 0) { tr.dir = 1; tr.t0 = t; }
-    // arrival at 0.84: blob's top edge merges into the reservoir underside
-    if (tr.dir === 1 && b.y >= 0.84) { transitsUp.push({ dt: t - tr.t0, r: b.r }); tr.dir = 2; }
+    // arrival at 0.80: blob reaches the dome-catch band (deposits or turns)
+    if (tr.dir === 1 && b.y >= 0.80) { transitsUp.push({ dt: t - tr.t0, r: b.r }); tr.dir = 2; }
     if (tr.dir === 1 && b.vy < -0.002) { midTurns.push(b.r); }
     if (tr.dir >= 1 && b.vy < -0.002) { // turned around → start downward watch
       tr.dir = -1; tr.t0 = t;
@@ -53,6 +56,10 @@ for (let step = 0; step < RUN_S / S.dt; step++) {
   });
 
   if (step % Math.round(10 / S.dt) === 0) maxDrift = Math.max(maxDrift, Math.abs(totalV() - v0));
+  if (firsts.detach < 0 && sim.ev.detaches > 0) firsts.detach = t;
+  if (firsts.absorbTop < 0 && sim.ev.absorbsTop > 0) firsts.absorbTop = t;
+  if (firsts.pendant < 0 && sim.ev.pendants > 0) firsts.pendant = t;
+  if (firsts.absorbBottom < 0 && sim.ev.absorbsBottom > 0) firsts.absorbBottom = t;
   if (step % Math.round(1 / S.dt) === 0) { // 1 Hz traffic sampling
     samples++;
     const risers = sim.blobs.filter(b => b.y > 0.12 && b.y < 0.88 && b.vy > 0.003).length;
@@ -87,5 +94,7 @@ console.log(`mid-column turnarounds: ${midTurns.length} (mean r ${(midTurns.redu
 const mg = sim.ev.merges, coil = mg.filter(m => m.coil), free = mg.filter(m => !m.coil);
 console.log(`merges: ${mg.length} total | ${coil.length} coil-zone (instant) | ${free.length} in-flight`);
 console.log(`kiss-to-fuse delay in-flight (s): ${stats(free.map(m => m.delay))}   [expect 1-8, §11]`);
-console.log(`absorbs: ${sim.ev.absorbs} | ledger spawns: ${sim.ev.spawns} | poolV now ${(sim.poolV * 1e4).toFixed(2)}e-4`);
+console.log(`pool events: ${sim.ev.detaches} detaches | ${sim.ev.absorbsTop} top deposits | ${sim.ev.pendants} pendants | ${sim.ev.absorbsBottom} bottom returns`);
+console.log(`self-priming firsts (s from cold): detach ${firsts.detach.toFixed(0)} | top deposit ${firsts.absorbTop.toFixed(0)} | pendant ${firsts.pendant.toFixed(0)} | bottom return ${firsts.absorbBottom.toFixed(0)}`);
+console.log(`ledgers now: bottom ${(sim.poolB.V * 1e4).toFixed(2)}e-4 (T ${sim.poolB.T.toFixed(2)}) | top ${(sim.poolT.V * 1e4).toFixed(2)}e-4 (T ${sim.poolT.T.toFixed(2)})`);
 console.log(`volume drift (gate: ~0): max ${maxDrift.toExponential(2)} of total ${v0.toExponential(3)} (rel ${(maxDrift / v0).toExponential(1)})`);
