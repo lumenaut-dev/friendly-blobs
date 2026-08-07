@@ -12,6 +12,13 @@
     font: 10px/1.4 ui-monospace, Menlo, monospace; color: #4a4650;
     user-select: none; pointer-events: none; letter-spacing: 0.06em;
   }
+  #mode {
+    position: fixed; right: 12px; bottom: 12px; z-index: 2;
+    width: 44px; height: 44px; border-radius: 50%; border: 1px solid #3a3540;
+    background: rgba(20,16,22,0.7); color: #c9a06a; font-size: 22px;
+    display: flex; align-items: center; justify-content: center;
+    user-select: none; cursor: pointer;
+  }
   #err {
     position: fixed; inset: 12px; z-index: 3; display: none;
     font: 12px/1.5 ui-monospace, Menlo, monospace; color: #ff9a8a;
@@ -22,7 +29,8 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="tag">PROJECT THERMO · P3 pools · self-priming melt cycle live</div>
+<div id="tag">PROJECT THERMO · P4 · hold to warm · tap glass to ripple</div>
+<div id="mode" title="touch warms (tap to switch to cool)">♨</div>
 <div id="err"></div>
 <script>
 "use strict";
@@ -113,6 +121,7 @@ const CONFIG = {
     domeCatch: 0.12, tauDome: 5.0,  // loitering within reach of the dome for
                                     // tauDome seconds → deposit into top pool (#6)
     tAbsorbTop: 1.2,       // blob melts into the top pool over this long
+    tAbsorbBottom: 0.8,    // coil breaks the film — bottom melt-in is quicker
     pendantVmin: 2.0e-4,   // top pool volume needed before a pendant drips
     tPendant: 4.0, jPendant: 0.01,       // pendant extrusion time + release nudge
     poolBRef: 1.1e-3, poolTRef: 0.77e-3, // ledger volumes at nominal visual scale
@@ -126,9 +135,17 @@ const CONFIG = {
     dTMax: 0.15, vRelMax: 0.03,   // drainage-progress gates
     coilY: 0.12, coilTau: 0.05,   // #25: coil zone → near-instant merge
     tMerge: 0.8,           // slurp duration
-    kHard: 0.018, kSoft: 0.085,   // per-blob smin driven by merge readiness
+    kHard: 0.028, kSoft: 0.085,   // per-blob smin driven by merge readiness
     kLerpRate: 6.0,
     rMaxMerge: 0.105,      // film persists if fusion would exceed this radius
+    // ---- P4: interaction (§7) — writes into L1 only ----
+    touchSigma: 0.09,      // gaussian heat/cool source, ~1.5 blob radii
+    kTouch: 0.14,          // warm/cool touch gain (sign = mode)
+    kNudge: 2.0, nudgeCap: 0.05,  // capped, heavily smoothed drag impulse
+    kTouchPool: 0.06, kTouchMelt: 1.5e-4,  // cursor over pool: softens + banks melt
+    jTap: 0.05, tapSigma: 0.12,   // #24 tap-the-glass radial impulse
+    // #9 wobble: damped shape oscillator per blob (replaces the P2 stub)
+    wobbleZeta: 0.25, wobbleHz: 1.2, wobbleGain: 0.22,
   },
   tailK: 0.07,             // tail smin softness (necks stay soft vs hard blobs)
   // L2-lite: trailing necks from position history + velocity stretch (#8).
@@ -136,8 +153,9 @@ const CONFIG = {
   // speed; in P2+ real merge/detach events replace the looping-tail fake.
   tailLagS: [2.3, 4.4],
   tailRadii: [0.60, 0.36],
-  stretchMax: 0.45,        // velocity elongation cap (#8)
-  stretchVref: 0.016,
+  stretchMax: 0.6,         // velocity elongation cap (#8)
+  stretchVref: 0.011,
+  breatheAmp: 0.05,        // #23: nothing is ever static — slow shape breathing
   // bottom pool dome: two pinned spheres, smin does the rest (stand-in for §6.2)
   pool: [
     [0.155, -0.085, -0.075, 0.01],
@@ -202,6 +220,7 @@ precision highp float;
 
 uniform vec2  uRes;
 uniform float uTime;
+uniform float uShake;   // #24 camera-space vessel shudder
 uniform vec4  uBlobA[NBLOB];  // xyz = pos, w = radius
 uniform vec4  uBlobB[NBLOB];  // x = T, y = sminK, zw reserved (L2 stretch)
 
@@ -224,10 +243,18 @@ float sdWax(vec3 p) {
   // 3.0 = pools, which merge with every layer.
   vec3 dl = vec3(1e5);
   for (int i = 0; i < NBLOB; i++) {
-    // uBlobB[i].z = vertical stretch (L2 ellipsoid, #8); gradient stays <= 1 for s >= 1
+    // uBlobB[i].z = SIGNED stretch (#8): |s| = elongation, sign = travel
+    // direction. Moving blobs are eggs: wide leading face, tapered trailing
+    // side, thinned laterally so elongation reads as fluid, not inflation.
     vec3 q = p - uBlobA[i].xyz;
-    q.y /= uBlobB[i].z;
-    float di = length(q) - uBlobA[i].w;
+    float sv = uBlobB[i].z;
+    float s = max(abs(sv), 0.25);
+    float egg = clamp((s - 1.0) * 0.8, 0.0, 0.28);
+    float lead = sv >= 0.0 ? 1.0 : -1.0;
+    float sy = (q.y * lead > 0.0) ? s * (1.0 + egg) : s * (1.0 - 0.7 * egg);
+    q.y /= sy;
+    q.xz *= sqrt(s);          // volume compensation: longer = thinner
+    float di = (length(q) - uBlobA[i].w) / (1.1 * max(sqrt(s), 1.0));
     float k = uBlobB[i].y;
     float layer = uBlobB[i].w;
     if (layer > 2.5) {
@@ -367,6 +394,7 @@ void main() {
   float sway = ${f(CONFIG.swayDeg * Math.PI / 180)} * sin(uTime * ${f(CONFIG.swayHz * 2 * Math.PI)});
   float cs = cos(sway), sn = sin(sway);
   vec3 ro = ${v3(CONFIG.camPos)};
+  ro.x += uShake;
   ro.xz = mat2(cs, -sn, sn, cs) * ro.xz;
   vec3 ta = ${v3(CONFIG.camTarget)};
   vec3 fw = normalize(ta - ro);
@@ -551,6 +579,7 @@ gl.useProgram(prog);
 
 const uRes = gl.getUniformLocation(prog, "uRes");
 const uTime = gl.getUniformLocation(prog, "uTime");
+const uShake = gl.getUniformLocation(prog, "uShake");
 const uBlobA = gl.getUniformLocation(prog, "uBlobA");
 const uBlobB = gl.getUniformLocation(prog, "uBlobB");
 
@@ -607,7 +636,7 @@ function spawnInto(b, C, rng, y0) {
   b.partner = -1;
   b.drainTimer = 0; b.mReady = 0; b.mergeT = 0;
   b.kNow = S.kHard;
-  b.wobble = 0; b.wobbleAge = 0;   // #9 preview; real oscillators in P4
+  b.w = 0; b.wdot = 0;    // #9 shape oscillator state (stretch perturbation)
   return b;
 }
 
@@ -635,8 +664,24 @@ function createSim(C, seed) {
              bulge: 0, bulgeX: 0, bulgeZ: 0, bulgeLayer: 1, nextR: 0 },
     poolT: { V: 0, T: C.sim.poolTT0,
              pendant: 0, pendantX: 0, pendantZ: 0, pendantLayer: 1, nextR: 0 },
+    // §7 interaction state: host writes it, sim reads it — L1 only
+    touch: { active: false, x: 0, y: 0, mode: 1, strength: 1, vx: 0, vy: 0 },
     ev: { merges: [], absorbsTop: 0, absorbsBottom: 0, detaches: 0, pendants: 0 },
   };
+}
+
+// #24 tap-the-glass: radial impulse to nearby blobs, excites #9 oscillators
+function applyTap(sim, C, x, y) {
+  const S = C.sim;
+  for (const b of sim.blobs) {
+    if (!b.active) continue;
+    const dx = b.x - x, dy = b.y - y;
+    const d = Math.hypot(dx, dy) + 1e-5;
+    const g = Math.exp(-(d * d) / (2 * S.tapSigma * S.tapSigma));
+    b.vx += (dx / d) * S.jTap * g;
+    b.vy += (dy / d) * S.jTap * g;
+    b.wdot += 6 * S.jTap * g * (2 * Math.PI * S.wobbleHz);
+  }
 }
 
 function sampleR(sim, S, capV) {
@@ -656,6 +701,16 @@ function simStep(sim, C) {
     const dT = (kZoneAt(b.y, S) * (TambAt(b.y, S) - b.T) + S.kBulb * gB) *
                (S.rRef / b.r) * b.seed;
     b.T = clamp(b.T + dT * dt, 0, 1);
+    // §7 warm/cool touch: gaussian heat source + capped, smoothed nudge.
+    // Heat is the verb — no positional grab, ever.
+    const TC = sim.touch;
+    if (TC.active) {
+      const tdx = b.x - TC.x, tdy = b.y - TC.y;
+      const gT = Math.exp(-(tdx * tdx + tdy * tdy) / (2 * S.touchSigma * S.touchSigma));
+      b.T = clamp(b.T + S.kTouch * TC.mode * TC.strength * gT * (S.rRef / b.r) * dt, 0, 1);
+      b.vx += clamp(TC.vx, -S.nudgeCap, S.nudgeCap) * gT * S.kNudge * dt;
+      b.vy += clamp(TC.vy, -S.nudgeCap, S.nudgeCap) * gT * S.kNudge * dt;
+    }
     b.melt = sstep(S.TMelt - S.meltWidth, S.TMelt + S.meltWidth, b.T);
 
     // 2. forces: buoyancy from ρ(T) crossover (§5.3), anisotropic drag
@@ -682,8 +737,10 @@ function simStep(sim, C) {
     // smin softness chases merge readiness (§5.4: dimple → slurp)
     const kTarget = S.kHard + (S.kSoft - S.kHard) * b.mReady;
     b.kNow += (kTarget - b.kNow) * Math.min(1, dt * S.kLerpRate);
-    b.wobble *= Math.exp(-dt / 0.9);
-    b.wobbleAge += dt;
+    // #9 shape oscillator: critically-under-damped ring-down (ζ, f from §10)
+    const om = 2 * Math.PI * S.wobbleHz;
+    b.wdot += (-2 * S.wobbleZeta * om * b.wdot - om * om * b.w) * dt;
+    b.w = clamp(b.w + b.wdot * dt, -0.6, 0.6);
   }
 
   contactPass(sim, C);
@@ -706,10 +763,12 @@ function contactPass(sim, C) {
   for (const b of bl) if (b.active && b.state === 1) b.state = 0; // re-derive
   for (let i = 0; i < bl.length; i++) {
     const a = bl[i];
-    if (!a.active || a.state !== 0) continue;
+    // absorbing blobs are mid-transfer into a pool ledger: merging one would
+    // double-count its volume (fusion + stale absorb record). Skip them.
+    if (!a.active || a.state !== 0 || a.absorbing) continue;
     for (let j = i + 1; j < bl.length; j++) {
       const c = bl[j];
-      if (!c.active || c.state !== 0 || a.layer !== c.layer) continue;
+      if (!c.active || c.state !== 0 || c.absorbing || a.layer !== c.layer) continue;
       const dx = c.x - a.x, dy = c.y - a.y, dz = c.z - a.z;
       const dist = Math.hypot(dx, dy, dz);
       if (dist >= a.r + c.r + S.contactEps) continue;
@@ -780,7 +839,7 @@ function mergePass(sim, C) {
       setRadius(surv, Math.cbrt(W), C);       // #7: volume-exact
       surv.state = 0; surv.partner = -1; surv.drainTimer = 0;
       surv.mReady = 1;                        // k relaxes hard smoothly
-      surv.wobble = 1; surv.wobbleAge = 0;    // #9 preview ring-down
+      surv.wdot += 0.5 * (2 * Math.PI * S.wobbleHz);  // #9: merge excites wobble
       gone.active = false; gone.state = 0; gone.partner = -1;
     }
   }
@@ -794,8 +853,18 @@ function poolPass(sim, C) {
 
   // ---- bottom pool: coil heats it; melt accumulates; bulge then release ----
   PB.T = clamp(PB.T + S.kPoolHeat * (S.poolTHot - PB.T) * dt, 0, 1);
-  PB.meltAccum = Math.min(PB.meltAccum + S.kMeltRate * Math.max(PB.T - S.TMelt, 0) * dt,
-                          8e-4);  // capped: waiting must not bank a burst
+  // §7 warm touch over the pool: softens it and banks melt faster (P4 gate:
+  // heat-cursor over the pool detaches a blob within ~4 s)
+  let touchG = 0;
+  const TC = sim.touch;
+  if (TC.active && TC.mode > 0 && TC.y < 0.18) {
+    touchG = TC.strength * Math.exp(-(TC.x * TC.x + (TC.y - 0.04) ** 2) /
+                                    (2 * S.touchSigma * S.touchSigma * 4));
+    PB.T = clamp(PB.T + S.kTouchPool * touchG * dt, 0, 1);
+  }
+  PB.meltAccum = Math.min(PB.meltAccum +
+    (S.kMeltRate * Math.max(PB.T - S.TMelt, 0) + S.kTouchMelt * touchG) * dt,
+    8e-4);  // capped: waiting must not bank a burst
   if (PB.nextR === 0) {
     const r = sampleR(sim, S, PB.V);
     if (r >= S.rMin) {
@@ -807,17 +876,19 @@ function poolPass(sim, C) {
   }
   const need = PB.nextR > 0 ? PB.nextR ** 3 : Infinity;
   if (PB.nextR > 0 && PB.meltAccum >= need && PB.V >= need) {
-    PB.bulge = Math.min(PB.bulge + dt / S.tBulge, 1);   // pool swells first (#5)
+    // pool swells first (#5); a warm touch hurries the bulge along
+    PB.bulge = Math.min(PB.bulge + (dt / S.tBulge) * (1 + 2.5 * touchG), 1);
     if (PB.bulge >= 1) {
       const slot = bl.find(b => !b.active);
       if (slot) {
-        spawnInto(slot, C, sim.rng, S.floorY + 0.01);
+        // spawn exactly where the bulge sphere ended — seamless handoff
+        spawnInto(slot, C, sim.rng, S.floorY + 0.01 + PB.nextR * 0.8);
         slot.layer = PB.bulgeLayer; slot.z = PB.bulgeZ;
         setRadius(slot, PB.nextR, C);
         slot.x = clamp(PB.bulgeX, -slot.xMax, slot.xMax);
         slot.T = PB.T; slot.melt = 1;
         slot.vy = S.jDetach;                            // decisive kick (§10)
-        slot.wobble = 0.7; slot.wobbleAge = 0;
+        slot.wdot += 0.35 * (2 * Math.PI * S.wobbleHz);
         PB.V -= need; PB.meltAccum -= need;
         PB.nextR = 0; PB.bulge = 0;
         sim.ev.detaches++;
@@ -853,7 +924,7 @@ function poolPass(sim, C) {
         slot.x = clamp(PT.pendantX, -slot.xMax, slot.xMax);
         slot.T = PT.T; slot.aloft = true;    // it is already aloft, may be absorbed below
         slot.vy = -S.jPendant;
-        slot.wobble = 0.5; slot.wobbleAge = 0;
+        slot.wdot += 0.25 * (2 * Math.PI * S.wobbleHz);
         PT.V -= PT.nextR ** 3;
         PT.nextR = 0; PT.pendant = 0;
         sim.ev.pendants++;
@@ -861,42 +932,44 @@ function poolPass(sim, C) {
     }
   }
 
-  // ---- free-blob ⇄ pool exchange ----
+  // ---- free-blob ⇄ pool exchange (both ends melt in incrementally: exact
+  // volume transfer, no one-frame pops) ----
   for (const b of bl) {
     if (!b.active || b.state === 2) continue;
-    // top: sustained dome press → melt into the reservoir over tAbsorbTop
+    if (b.absorbing) {
+      const A = b.absorbing;
+      const tau = A.top ? S.tAbsorbTop : S.tAbsorbBottom;
+      const dp = Math.min(dt / tau, 1 - A.p);
+      A.p += dp;
+      const moved = A.v0 * dp;
+      const P = A.top ? PT : PB;
+      P.T = (P.T * P.V + b.T * moved) / Math.max(P.V + moved, 1e-9);
+      P.V += moved;
+      b.r = Math.cbrt(Math.max(A.v0 * (1 - A.p), 1e-12));
+      b.y += (A.top ? 0.02 : -0.035) * dt / tau;  // drawn into the mass
+      if (A.p >= 1) {
+        deactivate(b, bl);
+        if (A.top) sim.ev.absorbsTop++; else sim.ev.absorbsBottom++;
+      }
+      continue;
+    }
+    // top: sustained loitering near the dome → melt into the reservoir (#6)
     const yTop = C.ceilY - 0.03 - b.r * 0.55;
     if (b.y > yTop - S.domeCatch && Math.abs(b.vy) < 0.004) {
       b.domeTimer = (b.domeTimer || 0) + dt;
-    } else if (!b.absorbing) {
+    } else {
       b.domeTimer = Math.max((b.domeTimer || 0) - dt * 2, 0);
     }
-    if (!b.absorbing && b.domeTimer > S.tauDome) {
-      b.absorbing = { v0: b.r ** 3, p: 0 };   // exact incremental transfer
-    }
-    if (b.absorbing) {
-      const dp = Math.min(dt / S.tAbsorbTop, 1 - b.absorbing.p);
-      b.absorbing.p += dp;
-      const moved = b.absorbing.v0 * dp;
-      PT.T = (PT.T * PT.V + b.T * moved) / Math.max(PT.V + moved, 1e-9);
-      PT.V += moved;
-      b.r = Math.cbrt(Math.max(b.absorbing.v0 * (1 - b.absorbing.p), 1e-12));
-      b.y += 0.02 * dt / S.tAbsorbTop;        // drawn up into the mass
-      if (b.absorbing.p >= 1) {
-        deactivate(b, bl);
-        sim.ev.absorbsTop++;
-      }
+    if (b.domeTimer > S.tauDome) {
+      b.absorbing = { v0: b.r ** 3, p: 0, top: true };
       continue;
     }
     // bottom: a cold sinking blob is absorbed at the pool SURFACE (~dome
     // height), before the near-floor reheat zone can flip it buoyant again —
     // otherwise it creeps at the crossover and bounces forever (see README
-    // invariant). Coil breaks the film, so absorption is instant (#25).
+    // invariant). Coil breaks the film (#25), so it melts in fast.
     if (b.aloft && b.y < S.recycleY && b.vy < -0.0005 && b.T < 0.45) {
-      PB.T = (PB.T * PB.V + b.T * b.r ** 3) / Math.max(PB.V + b.r ** 3, 1e-9);
-      PB.V += b.r ** 3;
-      deactivate(b, bl);
-      sim.ev.absorbsBottom++;
+      b.absorbing = { v0: b.r ** 3, p: 0, top: false };
     }
   }
 }
@@ -936,14 +1009,23 @@ function updateBlobs(sim, t) {
     }
     let stretch = 1 + CONFIG.stretchMax *
       Math.min(Math.abs(b.vy) / CONFIG.stretchVref, 1);
-    // post-merge ring-down preview (#9; proper oscillators in P4)
-    stretch *= 1 + 0.22 * b.wobble * Math.sin(2 * Math.PI * 1.3 * b.wobbleAge);
+    stretch *= 1 + CONFIG.sim.wobbleGain * b.w;                 // #9 ring-down
+    stretch *= 1 + CONFIG.breatheAmp * Math.sin(t * 0.9 + b.seed * 40); // #23
+    stretch = Math.max(stretch, 0.7);
+    const sv = stretch * (b.vy >= 0 ? 1 : -1);  // signed: egg leads the travel
     const rx = (b.px ?? b.x) + (b.x - (b.px ?? b.x)) * alpha;
     const ry = (b.py ?? b.y) + (b.y - (b.py ?? b.y)) * alpha;
-    put(rx, ry, b.z, b.r, b.T, b.kNow, Math.max(stretch, 0.7), b.layer);
+    put(rx, ry, b.z, b.r, b.T, b.kNow, sv, b.layer);
+    // tails collapse into the body as a merge/absorption completes, so the
+    // trailing spheres never vanish mid-column in a single frame
+    let tailMix = 0;
+    if (b.state === 2) tailMix = 1 - Math.max(b.mergeT, 0) / CONFIG.sim.tMerge;
+    else if (b.absorbing) tailMix = b.absorbing.p;
     for (let k = 0; k < CONFIG.tailRadii.length; k++) {
       const p = histAt(b, CONFIG.tailLagS[k], dt);
-      put(p[0], p[1], b.z, b.r * CONFIG.tailRadii[k], b.T, CONFIG.tailK, 1, b.layer);
+      const tx = p[0] + (rx - p[0]) * tailMix;
+      const ty = p[1] + (ry - p[1]) * tailMix;
+      put(tx, ty, b.z, b.r * CONFIG.tailRadii[k], b.T, CONFIG.tailK, 1, b.layer);
     }
   }
   // pool sizes track the volume ledgers (#7: pools visibly drain/refill)
@@ -996,6 +1078,75 @@ if (!qs.has("cold")) {
   const preSteps = Math.round(CONFIG.sim.warmStart / CONFIG.sim.dt);
   for (let i = 0; i < preSteps; i++) simStep(sim, CONFIG);
 }
+/* ---- §7 interaction: pointer → lamp space, writes sim.touch (L1 only) ---- */
+let uiMode = 1;   // 1 = warm touch, -1 = cool; toggle button or right-button
+let shake = 0;
+let pressed = false, downT = 0, downX = 0, downY = 0;
+let lastPX = 0, lastPY = 0, lastPT = 0;
+
+function pointerToLamp(e) {
+  const rect = canvas.getBoundingClientRect();
+  const ux = (2 * (e.clientX - rect.left) - rect.width) / rect.height;
+  const uy = (rect.height - 2 * (e.clientY - rect.top)) / rect.height;
+  // mirror the shader camera, sway ignored — approximation is fine (§7)
+  const ro = CONFIG.camPos, ta = CONFIG.camTarget;
+  let f = [ta[0] - ro[0], ta[1] - ro[1], ta[2] - ro[2]];
+  const fl = Math.hypot(...f); f = f.map(v => v / fl);
+  let r = [f[2], 0, -f[0]];   // cross(f, up) for up=(0,1,0), normalized below
+  const rl = Math.hypot(...r); r = r.map(v => v / rl);
+  const u = [r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]];
+  const rd = [
+    f[0] * CONFIG.camFocal + r[0] * ux + u[0] * uy,
+    f[1] * CONFIG.camFocal + r[1] * ux + u[1] * uy,
+    f[2] * CONFIG.camFocal + r[2] * ux + u[2] * uy,
+  ];
+  const tt = -ro[2] / rd[2];  // intersect the lamp mid-plane z = 0
+  return [ro[0] + rd[0] * tt, ro[1] + rd[1] * tt];
+}
+
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+canvas.addEventListener("pointerdown", (e) => {
+  const [x, y] = pointerToLamp(e);
+  pressed = true; downT = performance.now(); downX = x; downY = y;
+  sim.touch.active = true; sim.touch.strength = 1;
+  sim.touch.mode = e.button === 2 ? -1 : uiMode;
+  sim.touch.x = x; sim.touch.y = y;
+  lastPX = x; lastPY = y; lastPT = downT;
+});
+canvas.addEventListener("pointermove", (e) => {
+  const [x, y] = pointerToLamp(e);
+  const now = performance.now();
+  const dts = Math.max((now - lastPT) / 1000, 1e-3);
+  // heavily smoothed drag velocity → capped nudge (§7: no grabbing)
+  sim.touch.vx = 0.8 * sim.touch.vx + 0.2 * ((x - lastPX) / dts);
+  sim.touch.vy = 0.8 * sim.touch.vy + 0.2 * ((y - lastPY) / dts);
+  lastPX = x; lastPY = y; lastPT = now;
+  sim.touch.x = x; sim.touch.y = y;
+  if (!pressed && e.pointerType === "mouse") {   // desktop hover = gentle warmth
+    sim.touch.active = true; sim.touch.strength = 0.5; sim.touch.mode = uiMode;
+  }
+});
+canvas.addEventListener("pointerup", (e) => {
+  const [x, y] = pointerToLamp(e);
+  const quick = performance.now() - downT < 250;
+  const still = Math.hypot(x - downX, y - downY) < 0.02;
+  if (quick && still) {           // #24 tap the glass
+    applyTap(sim, CONFIG, x, y);
+    shake = 1;
+  }
+  pressed = false;
+  sim.touch.strength = 0.5;
+  if (e.pointerType !== "mouse") sim.touch.active = false;
+});
+canvas.addEventListener("pointerleave", () => { sim.touch.active = false; pressed = false; });
+
+const modeBtn = document.getElementById("mode");
+modeBtn.addEventListener("click", () => {
+  uiMode = -uiMode;
+  modeBtn.textContent = uiMode > 0 ? "♨" : "❄";
+  modeBtn.title = uiMode > 0 ? "touch warms (tap to switch to cool)" : "touch cools (tap to switch to warm)";
+});
+
 let acc = 0;
 let last = performance.now();
 function frame(now) {
@@ -1010,9 +1161,14 @@ function frame(now) {
   while (steps-- > 0) simStep(sim, CONFIG);
   sim.alpha = acc / CONFIG.sim.dt;
 
+  // drag-velocity and shudder decay in wall time
+  sim.touch.vx *= 0.92; sim.touch.vy *= 0.92;
+  shake *= Math.exp(-((now - last + 16) / 1000) * 5);
+
   updateBlobs(sim, sim.t);
   gl.uniform2f(uRes, canvas.width, canvas.height);
   gl.uniform1f(uTime, sim.t);
+  gl.uniform1f(uShake, shake * 0.005 * Math.sin(now * 0.055));
   gl.uniform4fv(uBlobA, blobA);
   gl.uniform4fv(uBlobB, blobB);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
